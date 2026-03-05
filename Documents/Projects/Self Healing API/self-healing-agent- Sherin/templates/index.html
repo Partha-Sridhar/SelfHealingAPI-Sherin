@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP Self-Healing Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f172a;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+            height: 90vh;
+            background: #1e293b;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid #334155;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            color: white;
+            padding: 25px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #334155;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .header .subtitle {
+            font-size: 13px;
+            opacity: 0.9;
+            margin-top: 4px;
+        }
+
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: #334155;
+            padding: 10px 16px;
+            border-radius: 30px;
+            border: 1px solid #475569;
+        }
+
+        .toggle-label {
+            font-size: 14px;
+            font-weight: 500;
+            color: #e2e8f0;
+        }
+
+        .toggle-switch {
+            position: relative;
+            width: 56px;
+            height: 28px;
+            background: #475569;
+            border-radius: 14px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        .toggle-switch.active {
+            background: #10b981;
+        }
+
+        .toggle-slider {
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 22px;
+            height: 22px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.3s;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        }
+
+        .toggle-switch.active .toggle-slider {
+            transform: translateX(28px);
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ef4444;
+            animation: pulse 2s infinite;
+        }
+
+        .toggle-switch.active .status-indicator {
+            background: #10b981;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .chat-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+            background: #0f172a;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .message.assistant {
+            display: flex;
+            justify-content: flex-start;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 14px 18px;
+            border-radius: 18px;
+            line-height: 1.5;
+            font-size: 15px;
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant .message-content {
+            background: #1e293b;
+            color: #e2e8f0;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            border: 1px solid #334155;
+        }
+
+        .metadata {
+            margin-top: 12px;
+            padding: 12px;
+            background: #422006;
+            border-left: 3px solid #f59e0b;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #fbbf24;
+        }
+
+        .metadata.error {
+            background: #450a0a;
+            border-left-color: #ef4444;
+            color: #fca5a5;
+        }
+
+        .metadata.success {
+            background: #022c22;
+            border-left-color: #10b981;
+            color: #6ee7b7;
+        }
+
+        .metadata-title {
+            font-weight: 600;
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .metadata-item {
+            margin: 4px 0;
+            padding-left: 16px;
+        }
+
+        .warning-badge {
+            display: inline-block;
+            background: #fbbf24;
+            color: #78350f;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: 6px;
+        }
+
+        .mode-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-top: 8px;
+        }
+
+        .mode-badge.interceptor {
+            background: #022c22;
+            color: #6ee7b7;
+            border: 1px solid #10b981;
+        }
+
+        .mode-badge.direct {
+            background: #450a0a;
+            color: #fca5a5;
+            border: 1px solid #ef4444;
+        }
+
+        .input-area {
+            padding: 20px 30px;
+            background: #1e293b;
+            border-top: 1px solid #334155;
+            display: flex;
+            gap: 12px;
+        }
+
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+        }
+
+        #messageInput {
+            width: 100%;
+            padding: 14px 20px;
+            border: 2px solid #334155;
+            border-radius: 25px;
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+
+        #messageInput:focus {
+            border-color: #3b82f6;
+        }
+
+        #messageInput::placeholder {
+            color: #64748b;
+        }
+
+        #sendButton {
+            padding: 14px 28px;
+            background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        #sendButton:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+        }
+
+        #sendButton:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .loading {
+            display: flex;
+            gap: 6px;
+            padding: 14px 18px;
+        }
+
+        .loading-dot {
+            width: 8px;
+            height: 8px;
+            background: #64748b;
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+
+        .loading-dot:nth-child(1) { animation-delay: -0.32s; }
+        .loading-dot:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+
+        .example-prompts {
+            padding: 20px 30px;
+            background: #1e293b;
+            border-bottom: 1px solid #334155;
+        }
+
+        .example-prompts-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #94a3b8;
+            margin-bottom: 10px;
+        }
+
+        .example-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .example-btn {
+            padding: 8px 14px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 16px;
+            font-size: 13px;
+            color: #cbd5e1;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .example-btn:hover {
+            background: #3b82f6;
+            color: white;
+            border-color: #3b82f6;
+            transform: translateY(-1px);
+        }
+
+        .cascade-info {
+            margin-top: 10px;
+            padding: 10px;
+            background: #1e1b4b;
+            border-left: 3px solid #8b5cf6;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #c4b5fd;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #475569;
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .empty-state-text {
+            font-size: 16px;
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>🛡️ MCP Self-Healing Demo</h1>
+                <div class="subtitle">See how the interceptor automatically fixes API errors</div>
+            </div>
+            <div class="toggle-container">
+                <div class="status-indicator"></div>
+                <span class="toggle-label">Interceptor</span>
+                <div class="toggle-switch active" id="interceptorToggle">
+                    <div class="toggle-slider"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="example-prompts">
+            <div class="example-prompts-title">Try these examples:</div>
+            <div class="example-buttons">
+                <button class="example-btn" data-prompt="what's the weather in london">🌤️ Weather in London</button>
+                <button class="example-btn" data-prompt="tell me about France">🌍 Country info</button>
+                <button class="example-btn" data-prompt="bitcoin price">₿ Bitcoin price</button>
+                <button class="example-btn" data-prompt="convert GBP to JPY">💱 Currency exchange</button>
+                <button class="example-btn" data-prompt="how much is apple stock">📈 Stock price</button>
+            </div>
+        </div>
+
+        <div class="chat-area" id="chatArea">
+            <div class="empty-state">
+                <div class="empty-state-icon">💬</div>
+                <div class="empty-state-text">Start a conversation to see the magic!</div>
+            </div>
+        </div>
+
+        <div class="input-area">
+            <div class="input-wrapper">
+                <input 
+                    type="text" 
+                    id="messageInput" 
+                    placeholder="Ask about weather, stocks, bitcoin, countries..."
+                    autocomplete="off"
+                />
+            </div>
+            <button id="sendButton">Send</button>
+        </div>
+    </div>
+
+    <script>
+        let interceptorEnabled = true;
+
+        // Toggle interceptor
+        document.getElementById('interceptorToggle').addEventListener('click', function() {
+            interceptorEnabled = !interceptorEnabled;
+            this.classList.toggle('active');
+            
+            const mode = interceptorEnabled ? 'enabled' : 'disabled';
+            addSystemMessage(`Interceptor ${mode}. ${interceptorEnabled ? '🛡️ Errors will be auto-healed.' : '⚡ Raw errors will be shown.'}`);
+        });
+
+        // Example prompts
+        document.querySelectorAll('.example-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                const prompt = this.dataset.prompt;
+                document.getElementById('messageInput').value = prompt;
+                sendMessage();
+            });
+        });
+
+        // Send message
+        document.getElementById('sendButton').addEventListener('click', sendMessage);
+        document.getElementById('messageInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        function addSystemMessage(text) {
+            const chatArea = document.getElementById('chatArea');
+            const emptyState = chatArea.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.innerHTML = `
+                <div class="message-content" style="background: #334155; color: #94a3b8; font-style: italic; border: 1px solid #475569;">
+                    ${text}
+                </div>
+            `;
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+
+        function addUserMessage(text) {
+            const chatArea = document.getElementById('chatArea');
+            const emptyState = chatArea.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message user';
+            messageDiv.innerHTML = `<div class="message-content">${escapeHtml(text)}</div>`;
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+
+        function addLoadingMessage() {
+            const chatArea = document.getElementById('chatArea');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.id = 'loadingMessage';
+            messageDiv.innerHTML = `
+                <div class="message-content">
+                    <div class="loading">
+                        <div class="loading-dot"></div>
+                        <div class="loading-dot"></div>
+                        <div class="loading-dot"></div>
+                    </div>
+                </div>
+            `;
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+
+        function removeLoadingMessage() {
+            const loading = document.getElementById('loadingMessage');
+            if (loading) loading.remove();
+        }
+
+        function addAssistantMessage(data) {
+            removeLoadingMessage();
+            
+            const chatArea = document.getElementById('chatArea');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            
+            let metadataHtml = '';
+            
+            // Error metadata
+            if (data.error) {
+                metadataHtml += `
+                    <div class="metadata error">
+                        <div class="metadata-title">❌ Error Details</div>
+                        <div class="metadata-item"><strong>Type:</strong> ${data.error.type}</div>
+                        <div class="metadata-item"><strong>Message:</strong> ${escapeHtml(data.error.message)}</div>
+                    </div>
+                `;
+            }
+            
+            // Tool usage metadata
+            if (data.tool_used) {
+                const metadataClass = data.error ? 'error' : (data.warnings.length > 0 ? 'metadata' : 'success');
+                metadataHtml += `
+                    <div class="metadata ${metadataClass}">
+                        <div class="metadata-title">
+                            🔧 Tool Call: ${data.tool_used}
+                            ${data.warnings.length > 0 ? '<span class="warning-badge">WARNING</span>' : ''}
+                        </div>
+                        <div class="metadata-item"><strong>Raw Args:</strong> ${JSON.stringify(data.raw_args)}</div>
+                        ${data.healing_steps.length > 0 ? `
+                            <div class="metadata-item"><strong>Healing:</strong></div>
+                            ${data.healing_steps.map(step => `<div class="metadata-item">• ${escapeHtml(step)}</div>`).join('')}
+                        ` : ''}
+                        ${data.warnings.length > 0 ? `
+                            <div class="metadata-item"><strong>Warnings:</strong></div>
+                            ${data.warnings.map(w => `<div class="metadata-item">⚠️ ${escapeHtml(w)}</div>`).join('')}
+                        ` : ''}
+                    </div>
+                `;
+            }
+            
+            // Cascade info
+            if (data.cascade_data) {
+                metadataHtml += `
+                    <div class="cascade-info">
+                        <div class="metadata-title">🔗 Cascaded Tool Calls</div>
+                        ${Object.entries(data.cascade_data).map(([key, value]) => `
+                            <div class="metadata-item"><strong>${key}:</strong> ${JSON.stringify(value)}</div>
+                        `).join('')}
+                    </div>
+                `;
+            }
+            
+            // Mode badge
+            const modeBadge = `<div class="mode-badge ${data.mode}">${data.mode === 'interceptor' ? '🛡️ Interceptor Mode' : '⚡ Direct Mode'}</div>`;
+            
+            messageDiv.innerHTML = `
+                <div class="message-content">
+                    ${escapeHtml(data.answer)}
+                    ${modeBadge}
+                </div>
+                ${metadataHtml}
+            `;
+            
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            input.value = '';
+            document.getElementById('sendButton').disabled = true;
+            
+            addUserMessage(message);
+            addLoadingMessage();
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: message,
+                        interceptor_enabled: interceptorEnabled
+                    })
+                });
+                
+                const data = await response.json();
+                addAssistantMessage(data);
+                
+            } catch (error) {
+                removeLoadingMessage();
+                addAssistantMessage({
+                    answer: `System error: ${error.message}`,
+                    error: { type: 'system_error', message: error.message },
+                    mode: interceptorEnabled ? 'interceptor' : 'direct',
+                    warnings: [],
+                    healing_steps: []
+                });
+            } finally {
+                document.getElementById('sendButton').disabled = false;
+                input.focus();
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Check interceptor status on load
+        async function checkStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                if (!data.interceptor_running && interceptorEnabled) {
+                    addSystemMessage('⚠️ Interceptor is not running. Start it with: python interceptor.py');
+                }
+            } catch (error) {
+                console.error('Status check failed:', error);
+            }
+        }
+
+        checkStatus();
+    </script>
+</body>
+</html>
