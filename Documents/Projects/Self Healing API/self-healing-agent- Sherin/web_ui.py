@@ -66,7 +66,7 @@ class SocketTransport:
     
     def __init__(self, host: str, port: int):
         self._sock = socket.create_connection((host, port), timeout=5)
-        self._sock.settimeout(30)
+        self._sock.settimeout(120)
         self._buf = ""
         log.info("connected to interceptor")
 

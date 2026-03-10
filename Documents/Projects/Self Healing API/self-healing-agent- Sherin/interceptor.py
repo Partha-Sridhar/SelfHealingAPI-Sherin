@@ -42,6 +42,11 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import ollama
+from sbsa import SBSAEngine, MCPDiscovery
+
+# Initialize SBSA engine (singleton - only once at startup)
+_sbsa_engine = SBSAEngine(threshold=0.35)
+_sbsa_discovery = None  # Will be initialized after TOOL_REGISTRY is defined
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -278,78 +283,143 @@ def _args_satisfy_schema(tool: str, args: Dict[str, Any], version: str) -> bool:
 
 class SchemaHealer:
     """
-    LLM-powered field-name repair AND value normalisation in one pass.
+    SBSA-powered field-name repair (replaces LLM-based healing).
 
-    SHORT-CIRCUIT: if all required fields for the current schema version are already
-    present and non-empty, args are returned unchanged — no LLM call.
-
-    Otherwise the LLM remaps field names and normalises values:
-      "location" -> "city"  |  "apple" -> "AAPL"  |  "euros" -> "EUR"
+    Uses semantic embeddings + Hungarian algorithm for deterministic,
+    fast (~30–50ms), zero-token parameter mapping.
     """
 
     @classmethod
-    def heal(cls, tool: str, raw_args: Dict[str, Any], force_version: str = None) -> Dict[str, Any]:
+    def _initialize_discovery(cls):
+        """
+        Lazy initialization of MCPDiscovery after TOOL_REGISTRY exists.
+        This avoids circular initialization issues during module load.
+        """
+        global _sbsa_discovery
+        if _sbsa_discovery is None:
+            _sbsa_discovery = MCPDiscovery(TOOL_REGISTRY)
+
+    @classmethod
+    def heal(
+        cls,
+        tool: str,
+        raw_args: Dict[str, Any],
+        force_version: str = None
+    ) -> Dict[str, Any]:
+        """
+        Heal schema mismatches using SBSA algorithm.
+
+        Args:
+            tool: Tool name (e.g., "get_weather")
+            raw_args: Arguments sent by the client
+            force_version: Optional override schema version ("v1" or "v2")
+
+        Returns:
+            Dict with corrected argument field names.
+        """
+
+        # Ensure discovery is initialized
+        cls._initialize_discovery()
+
         info = TOOL_REGISTRY.get(tool)
         if info is None:
             log.warning("  SchemaHealer | unknown tool '%s' — passing through", tool)
             return raw_args
 
+        # Tools with no required args need no healing
         if not info["required"]:
             return {}
 
-        version       = force_version or _server_schema_version["version"]
-        schema        = info.get(f"{version}_schema") or info.get("v1_schema", {})
-        server_fields = info.get(f"{version}_fields") or list(schema.keys())
+        # Determine schema version
+        version = force_version or _server_schema_version["version"]
 
-        # Short-circuit: args already match the current server schema
-        if server_fields and all(str(raw_args.get(f, "")).strip() for f in server_fields):
-            log.info(
-                "  SchemaHealer | args already valid for %s — pass-through  %s",
-                version, raw_args,
+        # Get required schema fields
+        required_fields = _sbsa_discovery.get_schema(tool, version)
+        if not required_fields:
+            log.warning(
+                "  SchemaHealer | no schema found for '%s' version=%s",
+                tool, version
             )
             return raw_args
 
+        # Filter internal metadata fields
+        agent_fields = [k for k in raw_args.keys() if not k.startswith("_")]
+
+        # Skip healing if schema requirements are already satisfied
+        if all(str(raw_args.get(f, "")).strip() for f in required_fields):
+            log.info(
+                "  SchemaHealer | args already valid for %s — pass-through  %s",
+                version, raw_args
+            )
+            return raw_args
+
+        # ──────────────────────────────────────────────
+        # SBSA HEALING
+        # ──────────────────────────────────────────────
+
         log.info(
-            "  SchemaHealer | healing '%s'  schema=%s  raw=%s",
-            tool, version, raw_args,
+            "  SchemaHealer[SBSA] | healing tool='%s' schema=%s raw=%s",
+            tool, version, raw_args
         )
 
-        prompt = f"""You are a JSON argument repair and normalisation system for an API proxy.
+        start_time = time.time()
 
-Tool         : {tool}
-Description  : {info['description']}
-Target schema (the exact field names the server expects right now):
-{json.dumps(schema, indent=2)}
-Client sent these args (field names may be wrong or values unnormalised):
-{json.dumps(raw_args, indent=2)}
+        mapping = _sbsa_engine.find_mapping(agent_fields, required_fields)
 
-TASK: Output a JSON object whose keys are EXACTLY those in Target schema.
-Rules:
-  1. Keys MUST be exactly those in Target schema — no additions, no renames.
-  2. Extract values from Client args and place them under the correct target key.
-     The values are correct — only the KEY names may be wrong.
-     Example: client sends {{"location": "London"}} but target needs {{"city": "London"}}.
-     Example: client sends {{"from": "GBP"}} but target needs {{"base": "GBP"}}.
-  3. Normalise values:
-       stock names/companies -> UPPERCASE ticker   (e.g. "apple" -> "AAPL")
-       currency words        -> ISO 4217 code      (e.g. "euros" -> "EUR")
-       country aliases       -> full English name  (e.g. "UK" -> "United Kingdom")
-       city casing           -> Title Case         (e.g. "new york" -> "New York")
-  4. If a value is genuinely absent, use a sensible default
-       (e.g. "Delhi" for city, "AAPL" for symbol, "USD" for base currency).
-  5. Return ONLY the corrected JSON object. No markdown, no explanation, no extra keys.
-"""
-        result = _llm(prompt, label=f"heal/{tool}/{version}")
+        latency_ms = (time.time() - start_time) * 1000
 
-        if result and any(v for v in result.values()):
-            log.info("  SchemaHealer | healed -> %s", result)
-            return result
+        # If SBSA fails to find a confident mapping
+        if not mapping:
+            log.warning(
+                "  SchemaHealer[SBSA] | no valid mapping found "
+                "(threshold=%.2f)",
+                _sbsa_engine.threshold
+            )
 
-        fallback = dict(info["defaults"])
-        if isinstance(result, dict):
-            fallback.update({k: v for k, v in result.items() if v})
-        log.warning("  SchemaHealer | using fallback -> %s", fallback)
-        return fallback
+            fallback = dict(info["defaults"])
+            fallback.update(raw_args)
+            return fallback
+
+        # Apply mapping
+        healed = {}
+
+        for agent_key, value in raw_args.items():
+            api_key = mapping.get(agent_key, agent_key)
+            healed[api_key] = value
+
+        log.info(
+            "  SchemaHealer[SBSA] | healed in %.1fms mapping=%s result=%s",
+            latency_ms,
+            mapping,
+            healed
+        )
+
+        # ──────────────────────────────────────────────
+        # Validate required fields
+        # ──────────────────────────────────────────────
+
+        missing = [
+            field for field in required_fields
+            if not str(healed.get(field, "")).strip()
+        ]
+
+        if missing:
+            log.warning(
+                "  SchemaHealer[SBSA] | missing required fields after healing: %s",
+                missing
+            )
+
+            for field in missing:
+                if field in info["defaults"]:
+                    healed[field] = info["defaults"][field]
+
+                    log.info(
+                        "  SchemaHealer[SBSA] | filled %s with default: %s",
+                        field,
+                        healed[field]
+                    )
+
+        return healed
 
 
 # ═══════════════════════════════════════════════════════════════
