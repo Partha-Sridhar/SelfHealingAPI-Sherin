@@ -1,0 +1,63 @@
+timestamp,tool,model,outcome,total_elapsed_s,retries,error_type,sbsa_elapsed_ms,sbsa_mapping,sbsa_similarities
+2026-03-29T09:59:20+0530,get_weather,llama3,success,31.259,0,,10362.04,{},{}
+2026-03-29T09:59:49+0530,get_weather,llama3,success,20.634,0,,0.51,{},{}
+2026-03-29T10:00:52+0530,get_country_info,llama3,success,21.705,0,,0.51,{},{}
+2026-03-29T10:01:37+0530,get_country_info,llama3,success,21.334,0,,0.51,{},{}
+2026-03-29T10:01:55+0530,get_bitcoin_price,llama3,success,0.541,0,,0.51,{},{}
+2026-03-29T10:02:10+0530,get_exchange_rate,llama3,Parse error,0.852,0,,0.51,{},{}
+2026-03-29T10:02:33+0530,get_stock_price,llama3,Upstream API error (5xx),6.218,0,,0.51,{},{}
+2026-03-29T10:02:45+0530,get_stock_price,llama3,Upstream API error (5xx),6.02,0,,0.51,{},{}
+2026-03-29T10:44:44+0530,get_bitcoin_price,llama3,success,0.631,0,,,{},{}
+2026-03-29T10:46:47+0530,get_country_info,llama3,success,1.46,0,,,{},{}
+2026-03-29T10:46:56+0530,get_country_info,llama3,success,1.318,0,,,{},{}
+2026-03-29T11:02:43+0530,get_country_info,llama3,success,7.835,0,,6953.45,"{""country"": ""country_name""}","{""country \u2192 country_name"": 0.8731746673583984}"
+2026-03-29T11:31:32+0530,get_country_info,llama3,success,7.161,0,,6260.29,"{""country"": ""country_name""}","{""country \u2192 country_name"": 0.8731746673583984}"
+2026-03-29T11:31:53+0530,get_country_info,llama3,success,0.733,0,,,{},{}
+2026-03-29T11:32:34+0530,get_country_info,llama3,success,0.726,0,,,{},{}
+2026-03-29T11:32:47+0530,get_country_info,llama3,success,0.734,0,,,{},{}
+2026-03-29T11:32:57+0530,get_weather,llama3,success,3.339,0,,,{},{}
+2026-03-29T11:33:54+0530,get_weather,llama3,success,0.631,0,,0.79,"{""location_name"": ""city""}","{""location_name \u2192 city"": 0.8060210347175598}"
+2026-03-29T11:34:22+0530,get_weather,llama3,success,0.64,0,,0.21,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:54:13+0530,get_weather,llama3,success,0.657,0,,,{},{}
+2026-03-29T11:54:20+0530,get_weather,llama3,success,0.652,0,,,{},{}
+2026-03-29T11:54:27+0530,get_weather,llama3,success,0.941,0,,,{},{}
+2026-03-29T11:54:40+0530,get_country_info,llama3,success,8.87,0,,,{},{}
+2026-03-29T11:54:47+0530,get_country_info,llama3,success,1.452,0,,,{},{}
+2026-03-29T11:54:52+0530,get_country_info,llama3,success,1.456,0,,,{},{}
+2026-03-29T11:55:03+0530,get_exchange_rate,llama3,success,6.353,0,,2865.45,"{""from_currency"": ""base"", ""to_currency"": ""target""}","{""from_currency \u2192 base"": 0.924568235874176, ""to_currency \u2192 target"": 0.9552505016326904}"
+2026-03-29T11:55:08+0530,get_exchange_rate,llama3,success,0.954,0,,834.75,{},{}
+2026-03-29T11:55:13+0530,get_bitcoin_price,llama3,success,0.101,0,,,{},{}
+2026-03-29T11:55:18+0530,get_stock_price,llama3,success,1.284,0,,1282.58,"{""stock_symbol"": ""symbol""}","{""stock_symbol \u2192 symbol"": 0.7230066061019897}"
+2026-03-29T11:55:23+0530,get_stock_price,llama3,success,0.283,0,,276.13,"{""stock_name"": ""symbol""}","{""stock_name \u2192 symbol"": 0.5021809339523315}"
+2026-03-29T11:55:28+0530,get_weather,llama3,success,0.645,0,,,{},{}
+2026-03-29T11:56:12+0530,get_weather,llama3,success,1.084,0,,451.27,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:56:18+0530,get_weather,llama3,success,0.775,0,,0.06,"{""location"": ""location_name""}","{""location \u2192 location_name"": 0.504101037979126}"
+2026-03-29T11:56:25+0530,get_weather,llama3,success,0.759,0,,0.31,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:56:31+0530,get_country_info,llama3,success,1.471,0,,0.1,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:56:37+0530,get_country_info,llama3,success,1.326,0,,0.24,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:56:42+0530,get_country_info,llama3,success,1.346,0,,0.24,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:56:46+0530,get_exchange_rate,llama3,Schema drift,0.002,0,,0.07,{},{}
+2026-03-29T11:56:49+0530,get_exchange_rate,llama3,success,0.121,0,,,{},{}
+2026-03-29T11:56:54+0530,get_bitcoin_price,llama3,success,0.381,0,,,{},{}
+2026-03-29T11:56:58+0530,get_stock_price,llama3,success,0.758,0,,350.78,"{""stock"": ""ticker""}","{""stock \u2192 ticker"": 0.3784065842628479}"
+2026-03-29T11:57:02+0530,get_stock_price,llama3,success,0.003,0,,0.95,"{""symbol"": ""ticker""}","{""symbol \u2192 ticker"": 0.9804815053939819}"
+2026-03-29T11:57:06+0530,get_weather,llama3,success,0.638,0,,0.17,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:57:25+0530,get_weather,llama3,success,0.624,0,,0.35,"{""location_name"": ""city""}","{""location_name \u2192 city"": 0.8060210347175598}"
+2026-03-29T11:57:27+0530,get_weather,llama3,success,0.635,0,,0.14,"{""location_name"": ""city""}","{""location_name \u2192 city"": 0.8060210347175598}"
+2026-03-29T11:57:29+0530,get_weather,llama3,success,0.629,0,,0.21,"{""location_name"": ""city""}","{""location_name \u2192 city"": 0.8060210347175598}"
+2026-03-29T11:57:33+0530,get_country_info,llama3,success,1.468,0,,,{},{}
+2026-03-29T11:57:39+0530,get_country_info,llama3,success,1.394,0,,,{},{}
+2026-03-29T11:57:46+0530,get_country_info,llama3,success,1.48,0,,,{},{}
+2026-03-29T11:57:50+0530,get_exchange_rate,llama3,success,0.12,0,,0.53,"{""from_currency"": ""base"", ""to_currency"": ""target""}","{""from_currency \u2192 base"": 0.924568235874176, ""to_currency \u2192 target"": 0.9552505016326904}"
+2026-03-29T11:57:55+0530,get_exchange_rate,llama3,success,0.119,0,,0.26,"{""from_currency"": ""base"", ""to_currency"": ""target""}","{""from_currency \u2192 base"": 0.924568235874176, ""to_currency \u2192 target"": 0.9552505016326904}"
+2026-03-29T11:58:03+0530,get_stock_price,llama3,success,0.002,0,,0.31,"{""ticker"": ""symbol""}","{""ticker \u2192 symbol"": 0.9804815053939819}"
+2026-03-29T11:58:08+0530,get_stock_price,llama3,success,0.001,0,,0.17,"{""ticker"": ""symbol""}","{""ticker \u2192 symbol"": 0.9804815053939819}"
+2026-03-29T11:58:14+0530,get_weather,llama3,success,0.644,0,,0.23,"{""location_name"": ""city""}","{""location_name \u2192 city"": 0.8060210347175598}"
+2026-03-29T11:58:56+0530,get_weather,llama3,success,0.629,0,,0.82,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:59:02+0530,get_weather,llama3,success,0.626,0,,0.24,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:59:14+0530,get_country_info,llama3,success,1.573,0,,0.27,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:59:19+0530,get_country_info,llama3,success,1.538,0,,0.18,"{""city"": ""location_name""}","{""city \u2192 location_name"": 0.8060210347175598}"
+2026-03-29T11:59:22+0530,get_exchange_rate,llama3,success,0.27,0,,0.41,"{""base"": ""from_currency"", ""target"": ""to_currency""}","{""base \u2192 from_currency"": 0.924568235874176, ""target \u2192 to_currency"": 0.9552505016326904}"
+2026-03-29T11:59:28+0530,get_exchange_rate,llama3,success,0.151,0,,1.11,"{""base"": ""from_currency"", ""target"": ""to_currency""}","{""base \u2192 from_currency"": 0.924568235874176, ""target \u2192 to_currency"": 0.9552505016326904}"
+2026-03-29T11:59:36+0530,get_stock_price,llama3,success,0.003,0,,0.38,"{""symbol"": ""ticker""}","{""symbol \u2192 ticker"": 0.9804815053939819}"
+2026-03-29T11:59:41+0530,get_stock_price,llama3,success,0.005,0,,0.77,"{""symbol"": ""ticker""}","{""symbol \u2192 ticker"": 0.9804815053939819}"

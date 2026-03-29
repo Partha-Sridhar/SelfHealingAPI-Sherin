@@ -1,0 +1,3 @@
+Model,Baseline (No Drift) %,Baseline (Drift) %,SBSA (No Drift) %,SBSA (Drift) %,Recovery Improvement %,Natural Mismatch Rate %,Tool Accuracy %,Avg LLM Latency ms,Tokens Saved,Step Efficiency
+groq/llama-3.3-70b-versatile,100.0,8.3,91.7,66.7,58.4,22.9,93.8,1699.2,3160,3x → 1x
+ollama/llama3,58.3,33.3,100.0,91.7,58.4,47.9,100.0,2668.7,4290,3x → 1x

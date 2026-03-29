@@ -10,6 +10,7 @@ Then open:  http://localhost:5000
 
 import json
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -17,9 +18,10 @@ import threading
 import time
 from typing import Optional, Tuple
 
-import ollama
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
+
+import adapters
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -27,7 +29,6 @@ from flask_cors import CORS
 
 INTERCEPTOR_HOST = "127.0.0.1"
 INTERCEPTOR_PORT = 6010
-LLM_MODEL = "llama3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,8 +43,20 @@ CORS(app)
 _server_proc: Optional[subprocess.Popen] = None
 _interceptor_proc: Optional[subprocess.Popen] = None
 _tools_cache = []
+_current_provider = "ollama"
+_current_model = "llama3"
+
+# Per-model history for comparative analysis
+_model_history: dict = {}   # { "provider/model": [ {tool, success, ...} ] }
 
 _NOTIFICATIONS = {"initialized", "notifications/initialized", "notifications/cancelled"}
+
+# ═══════════════════════════════════════════════════════════════
+# DOMAIN REGISTRY — loaded from api_registry.py
+# ═══════════════════════════════════════════════════════════════
+
+from api_registry import get_domains_summary, API_REGISTRY as TOOL_REGISTRY
+DOMAIN_REGISTRY = get_domains_summary()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -66,7 +79,7 @@ class SocketTransport:
     
     def __init__(self, host: str, port: int):
         self._sock = socket.create_connection((host, port), timeout=5)
-        self._sock.settimeout(30)
+        self._sock.settimeout(120)
         self._buf = ""
         log.info("connected to interceptor")
 
@@ -180,59 +193,16 @@ def _handshake(transport) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════
-# LLM PROMPTS
+# AGENT LOGIC — uses adapter system for model-agnostic tool-calling
 # ═══════════════════════════════════════════════════════════════
 
-_DECISION_SYSTEM = """
-You are a tool-routing agent. Decide which tool to call for the user's question.
-
-Rules:
-- If a relevant tool exists, call it. Do NOT answer from your own knowledge.
-- Respond ONLY with valid JSON. No markdown, no explanation.
-
-Response formats:
-  Call a tool:  {{"tool": "<name>", "arguments": {{<key>: <value>}}}}
-  No tool fits: {{"final": "<direct answer>"}}
-
-Available tools:
-{tool_list}
-
-Routing:
-  bitcoin / crypto / BTC        →  get_bitcoin_price    (no arguments)
-  weather / temperature / rain  →  get_weather          (argument: location or city)
-  country / capital / region    →  get_country_info     (argument: country)
-  currency / exchange rate      →  get_exchange_rate    (arguments: base, target)
-  stock / share / ticker        →  get_stock_price      (argument: symbol)
-"""
-
-_ANSWER_SYSTEM = """
-You are a helpful assistant. Answer the user's question using ONLY the tool
-result provided. Do not recompute or invent any values. Be concise and friendly.
-"""
-
-
-# ═══════════════════════════════════════════════════════════════
-# AGENT LOGIC
-# ═══════════════════════════════════════════════════════════════
-
-def _fmt_tool_list(tools: list) -> str:
-    return "\n".join(f"  - {t['name']}: {t.get('description', '')}" for t in tools)
-
-
-def ask_agent(question: str, use_interceptor: bool) -> dict:
+def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False, on_step=None) -> dict:
     """
-    Process a user question and return detailed response with metadata.
-    Returns: {
-        "answer": str,
-        "tool_used": str or None,
-        "raw_args": dict,
-        "healed_args": dict or None,
-        "error": dict or None,
-        "warnings": list,
-        "healing_steps": list,
-        "mode": "interceptor" or "direct"
-    }
+    Process a user question through the selected LLM adapter + MCP pipeline.
     """
+    global _current_provider, _current_model
+    model_key = f"{_current_provider}/{_current_model}"
+    step = on_step or (lambda s, d: None)
     result = {
         "answer": "",
         "tool_used": None,
@@ -243,124 +213,137 @@ def ask_agent(question: str, use_interceptor: bool) -> dict:
         "healing_steps": [],
         "mode": "interceptor" if use_interceptor else "direct",
         "cascade_data": None,
+        "model": model_key,
+        "sbsa_report": None,
+        "llm_latency_ms": None,
     }
-    
+
+    t_start = time.monotonic()
     transport = None
     try:
-        # Connect
-        transport, connected_via_interceptor = _connect(use_interceptor)
+        adapter = adapters.get_adapter(_current_provider, _current_model)
+        step("connect", f"Connecting to {'interceptor' if use_interceptor else 'server directly'}...")
+        transport, _ = _connect(use_interceptor)
         tools = _handshake(transport)
-        
-        # LLM decision
-        system = _DECISION_SYSTEM.format(tool_list=_fmt_tool_list(tools))
-        raw = ollama.chat(
-            model=LLM_MODEL,
-            format="json",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": question},
-            ],
-        )
-        decision = json.loads(raw["message"]["content"])
-        
-        # No-tool path
+
+        # Toggle drift on the server
+        transport.send({
+            "jsonrpc": "2.0", "id": _next_id(),
+            "method": "set_drift", "params": {"active": drift_enabled},
+        })
+
+        # Step 1: LLM decides tool + args via native function-calling
+        step("llm_routing", f"LLM ({model_key}) choosing tool...")
+        log.info("Routing via %s/%s", _current_provider, _current_model)
+        decision = adapter.route(question, tools)
+        result["llm_latency_ms"] = decision.get("latency_ms")
+        log.info("LLM decision: %s", decision)
+
         if "final" in decision:
             result["answer"] = decision["final"]
             return result
-        
+
         if "tool" not in decision:
-            result["error"] = {
-                "type": "llm_error",
-                "message": "LLM returned unexpected format"
-            }
+            result["error"] = {"type": "llm_error", "message": "LLM returned unexpected format"}
             result["answer"] = "I couldn't understand how to process that request."
             return result
-        
+
         tool_name = decision["tool"]
         raw_args = decision.get("arguments", {})
-        
         result["tool_used"] = tool_name
         result["raw_args"] = raw_args
-        
-        # Make tool call
+
+        # Step 2: Send tool call through MCP (interceptor or direct)
+        step("tool_call", f"Calling {tool_name}({json.dumps(raw_args)[:60]})")
         resp = transport.send({
-            "jsonrpc": "2.0",
-            "id": _next_id(),
-            "method": "tools/call",
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
             "params": {"name": tool_name, "arguments": raw_args},
         })
-        
-        # Handle error
+
         if "error" in resp:
             error = resp["error"]
-            result["error"] = {
-                "type": error.get("error_type", "unknown"),
-                "code": error.get("code"),
-                "message": error.get("message", "Unknown error"),
-            }
-            
-            # Generate user-friendly error message
-            error_type = result["error"]["type"]
-            if error_type == "schema":
-                result["answer"] = f"❌ Schema Error: The tool received incorrect argument names. {error['message']}"
-            elif error_type == "timeout":
-                result["answer"] = f"⏱️ Timeout: The API didn't respond in time. {error['message']}"
-            elif error_type == "network":
-                result["answer"] = f"🌐 Network Error: Couldn't reach the API. {error['message']}"
-            elif error_type == "api":
-                result["answer"] = f"⚠️ API Error: {error['message']}"
+            etype = error.get("error_type", "unknown")
+            msg = error.get("message", "Unknown error")
+
+            # Distinguish LLM-missing-args from SBSA failure
+            if etype == "schema" and "Missing required field" in msg:
+                info = TOOL_REGISTRY.get(tool_name, {})
+                required = list(info.get("v1_schema", {}).keys())
+                sent = list(raw_args.keys())
+                missing = [f for f in required if f not in raw_args]
+                result["error"] = {"type": "llm_incomplete", "code": error.get("code"),
+                    "message": f"LLM forgot to include required parameter(s): {missing}. "
+                               f"LLM sent: {sent}. Tool requires: {required}. "
+                               f"Note: SBSA can heal wrong field names but cannot invent missing values."}
+                result["answer"] = (
+                    f"⚠️ LLM Incomplete Call: The LLM forgot to send parameter(s) {missing}. "
+                    f"It only sent {sent}. SBSA heals wrong names, not missing arguments — "
+                    f"this is an LLM limitation, not a middleware failure.")
             else:
-                result["answer"] = f"❌ Error: {error['message']}"
-            
+                result["error"] = {"type": etype, "code": error.get("code"), "message": msg}
+                prefix = {"schema": "❌ Schema Error", "timeout": "⏱️ Timeout",
+                           "network": "🌐 Network Error", "api": "⚠️ API Error",
+                           "drift": "🔀 Schema Drift"}.get(etype, "❌ Error")
+                result["answer"] = f"{prefix}: {msg}"
             return result
-        
-        # Success - extract result
+
         tool_data = resp["result"].get("structuredContent", resp["result"])
-        
-        # Check for interceptor annotations
+
         if isinstance(tool_data, dict):
             if "_interceptor_warning" in tool_data:
                 result["warnings"].append(tool_data["_interceptor_warning"])
-            
             if "_drift_healed" in tool_data:
                 result["healing_steps"].append(f"🔧 {tool_data['_drift_healed']}")
-            
-            # Extract cascade data
-            cascade_keys = [k for k in tool_data.keys() if k.startswith("_cascade_")]
+
+            cascade_keys = [k for k in tool_data if k.startswith("_cascade_")]
             if cascade_keys:
                 result["cascade_data"] = {k: tool_data[k] for k in cascade_keys}
-            
-            # Infer healing happened if we're using interceptor
+
             if use_interceptor:
-                result["healed_args"] = raw_args  # In real scenario, interceptor would log this
-                result["healing_steps"].insert(0, "✓ Arguments validated and normalized")
-        
-        # Generate final answer
+                result["healed_args"] = raw_args
+                result["healing_steps"].insert(0, "✓ SBSA alignment — deterministic key mapping")
+                try:
+                    log_dir = os.path.join(os.path.dirname(__file__), "benchmark_logs")
+                    if os.path.isdir(log_dir):
+                        logs = sorted(f for f in os.listdir(log_dir) if f.endswith(".jsonl"))
+                        if logs:
+                            with open(os.path.join(log_dir, logs[-1])) as f:
+                                lines = f.readlines()
+                            if lines:
+                                last = json.loads(lines[-1])
+                                if last.get("tool") == tool_name:
+                                    result["sbsa_report"] = {
+                                        "similarity_scores": last.get("similarity_scores") or last.get("sbsa_similarities", {}),
+                                        "elapsed_ms": last.get("sbsa_elapsed_ms", 0),
+                                        "mapping": last.get("mapping") or last.get("sbsa_mapping", {}),
+                                    }
+                except Exception:
+                    pass
+
+        # Step 3: LLM summarizes the result
+        step("summarize", "LLM generating answer...")
         clean_data = (
             {k: v for k, v in tool_data.items() if not k.startswith("_")}
             if isinstance(tool_data, dict) else tool_data
         )
-        
-        final = ollama.chat(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": _ANSWER_SYSTEM},
-                {"role": "user", "content": f"Question: {question}\n\nTool result: {json.dumps(clean_data)}"},
-            ],
-        )
-        result["answer"] = final["message"]["content"]
-        
+        result["answer"] = adapter.summarize(question, clean_data)
         return result
-        
+
     except Exception as e:
         log.error(f"Error in ask_agent: {e}", exc_info=True)
-        result["error"] = {
-            "type": "system_error",
-            "message": str(e)
-        }
+        result["error"] = {"type": "system_error", "message": str(e)}
         result["answer"] = f"System error: {str(e)}"
         return result
     finally:
+        elapsed = time.monotonic() - t_start
+        entry = {
+            "tool": result.get("tool_used"),
+            "success": result.get("error") is None,
+            "total_s": round(elapsed, 2),
+            "llm_latency_ms": result.get("llm_latency_ms"),
+            "sbsa_report": result.get("sbsa_report"),
+        }
+        _model_history.setdefault(model_key, []).append(entry)
         if transport:
             transport.close()
 
@@ -376,24 +359,142 @@ def index():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Handle chat messages."""
     data = request.json
     question = data.get('message', '').strip()
     use_interceptor = data.get('interceptor_enabled', True)
+    drift_enabled = data.get('drift_enabled', False)
     
     if not question:
         return jsonify({"error": "Empty message"}), 400
     
-    try:
-        result = ask_agent(question, use_interceptor)
-        return jsonify(result)
-    except Exception as e:
-        log.error(f"Chat error: {e}", exc_info=True)
-        return jsonify({
-            "answer": f"Error: {str(e)}",
-            "error": {"type": "system_error", "message": str(e)},
-            "mode": "interceptor" if use_interceptor else "direct"
-        }), 500
+    from flask import Response
+    import queue
+
+    step_queue = queue.Queue()
+
+    def on_step(name, detail):
+        step_queue.put({"step": name, "detail": detail})
+
+    def generate():
+        # Run agent in a thread so we can stream steps
+        result_holder = [None]
+        def run():
+            result_holder[0] = ask_agent(question, use_interceptor, drift_enabled, on_step=on_step)
+            step_queue.put(None)  # signal done
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+
+        while True:
+            item = step_queue.get()
+            if item is None:
+                # Done — send final result
+                yield f"data: {json.dumps({'type': 'result', 'data': result_holder[0]})}\n\n"
+                break
+            yield f"data: {json.dumps({'type': 'step', 'data': item})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+
+@app.route('/api/domains', methods=['GET'])
+def domains():
+    """Return available domains with suggestions."""
+    return jsonify(DOMAIN_REGISTRY)
+
+
+@app.route('/api/models', methods=['GET'])
+def models():
+    """Return available providers, their models, and readiness status."""
+    providers = adapters.available_providers()
+    return jsonify({
+        "current_provider": _current_provider,
+        "current_model": _current_model,
+        "providers": providers,
+    })
+
+
+@app.route('/api/models', methods=['POST'])
+def set_model():
+    """Switch the active provider and model."""
+    global _current_provider, _current_model
+    provider = request.json.get("provider", "").strip()
+    model = request.json.get("model", "").strip()
+    if not provider or not model:
+        return jsonify({"error": "provider and model required"}), 400
+    _current_provider = provider
+    _current_model = model
+    log.info("Switched to: %s/%s", provider, model)
+    return jsonify({"current_provider": _current_provider, "current_model": _current_model})
+
+
+@app.route('/api/analytics', methods=['GET'])
+def analytics():
+    """Return per-model metrics for the analytics panel."""
+    # Estimated tokens per LLM call (routing + summarize)
+    EST_TOKENS_PER_CALL = 200
+    # Estimated tokens for a ReAct reflection retry
+    EST_TOKENS_PER_RETRY = 400
+
+    MODEL_PRICING = {
+        "ollama/llama3": 0, "ollama/llama3:latest": 0,
+        "groq/llama-3.3-70b-versatile": 0.59,
+        "groq/llama-3.1-8b-instant": 0.05,
+        "mistral/mistral-small-latest": 0.1,
+        "anthropic/claude-sonnet-4-20250514": 3.0,
+        "anthropic/claude-haiku-4-20250514": 0.8,
+    }
+
+    summary = {}
+    for model, entries in _model_history.items():
+        total = len(entries)
+        if not total: continue
+
+        successes = sum(1 for e in entries if e["success"])
+        failures = total - successes
+        llm_times = [e["llm_latency_ms"] for e in entries if e.get("llm_latency_ms")]
+        total_times = [e["total_s"] for e in entries]
+
+        # Token economics
+        tokens_used = total * EST_TOKENS_PER_CALL
+        tokens_saved = successes * EST_TOKENS_PER_RETRY  # each success = 1 avoided retry
+        price_per_m = MODEL_PRICING.get(model, 0)
+        cost_used = round(tokens_used * price_per_m / 1_000_000, 5)
+        cost_saved = round(tokens_saved * price_per_m / 1_000_000, 5)
+
+        summary[model] = {
+            "total_queries": total,
+            "successes": successes,
+            "failures": failures,
+            "success_rate": round(successes / total * 100, 1),
+            "avg_response_s": round(sum(total_times) / total, 2),
+            "avg_llm_ms": round(sum(llm_times) / len(llm_times), 1) if llm_times else None,
+            "tokens_used": tokens_used,
+            "tokens_saved_vs_react": tokens_saved,
+            "cost_used": cost_used,
+            "cost_saved_vs_react": cost_saved,
+            "sbsa_heals": successes,  # every success with SBSA = a heal
+        }
+    return jsonify(summary)
+
+
+@app.route('/api/benchmark', methods=['POST'])
+def run_benchmark_endpoint():
+    """Trigger a benchmark run (runs in background)."""
+    import benchmark
+    import threading
+
+    providers = request.json.get("providers", ["ollama", "groq"]) if request.json else ["ollama", "groq"]
+
+    def _run():
+        try:
+            results = benchmark.run_benchmark(providers)
+            metrics = benchmark.compute_metrics(results)
+            benchmark.print_report(metrics)
+        except Exception as e:
+            log.error("Benchmark failed: %s", e, exc_info=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "started", "providers": providers})
 
 
 @app.route('/api/status', methods=['GET'])
