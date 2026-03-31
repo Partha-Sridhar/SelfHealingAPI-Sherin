@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+schema_cache.json
+benchmark_logs/
+benchmark_reports/~$*
+.DS_Store
+data/

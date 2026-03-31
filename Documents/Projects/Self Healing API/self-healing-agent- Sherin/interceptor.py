@@ -33,6 +33,7 @@ Run:  python interceptor.py
 
 import json
 import logging
+import os
 import re
 import socket
 import subprocess
@@ -42,11 +43,8 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import ollama
-from sbsa import SBSAEngine, MCPDiscovery
-
-# Initialize SBSA engine (singleton - only once at startup)
-_sbsa_engine = SBSAEngine(threshold=0.35)
-_sbsa_discovery = None  # Will be initialized after TOOL_REGISTRY is defined
+import sbsa_engine
+import analytics_logger
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -129,88 +127,35 @@ class ServerManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TOOL REGISTRY
+# TOOL REGISTRY — loaded from api_registry.py
 # ═══════════════════════════════════════════════════════════════
 
-TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "get_bitcoin_price": {
-        "description":     "Returns the current Bitcoin price in USD. Takes NO arguments.",
-        "required":        [],
+from api_registry import API_REGISTRY
+import schema_discovery
+
+TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
+for _name, _info in API_REGISTRY.items():
+    _v1 = _info["v1_schema"]
+    _v2 = _info["v2_schema"]
+    TOOL_REGISTRY[_name] = {
+        "description":     _info["description"],
+        "category":        _info["domain"],
+        "required":        [k for k, v in _v1.items() if v.get("required")],
         "defaults":        {},
-        "v1_fields":       [],
-        "v2_fields":       [],
-        "v1_schema":       {},
-        "v2_schema":       {},
-        "expected_result": ["bitcoin_usd"],
-        "result_ranges":   {"bitcoin_usd": (1_000, 200_000)},
+        "v1_fields":       list(_v1.keys()),
+        "v2_fields":       list(_v2.keys()),
+        "v1_schema":       {k: v.get("description", "") for k, v in _v1.items()},
+        "v2_schema":       {k: v.get("description", "") for k, v in _v2.items()},
+        "expected_result": [],
+        "result_ranges":   {},
         "cascade":         None,
-    },
-    # V1: city          V2: location_name
-    "get_weather": {
-        "description":     "Returns current weather for a city or location.",
-        "required":        ["city"],
-        "defaults":        {"city": "Delhi"},
-        "v1_fields":       ["city"],
-        "v2_fields":       ["location_name"],
-        "v1_schema":       {"city":          "string — name of the city"},
-        "v2_schema":       {"location_name": "string — name of the city or location"},
-        "expected_result": ["city", "temperature_c", "windspeed_kmh"],
-        "result_ranges":   {"temperature_c": (-80, 60), "windspeed_kmh": (0, 400)},
-        "cascade":         None,
-    },
-    # V1: country       V2: country_name
-    "get_country_info": {
-        "description":     "Returns facts about a country (capital, population, region).",
-        "required":        ["country"],
-        "defaults":        {"country": "India"},
-        "v1_fields":       ["country"],
-        "v2_fields":       ["country_name"],
-        "v1_schema":       {"country":      "string — name of the country"},
-        "v2_schema":       {"country_name": "string — full name of the country"},
-        "expected_result": ["country", "capital", "population", "region"],
-        "result_ranges":   {"population": (100, 2_000_000_000)},
-        "cascade": {
-            "trigger_field": "capital",
-            "next_tool":     "get_weather",
-            "arg_map":       {"city": "capital"},
-        },
-    },
-    # V1: base/target   V2: from_currency/to_currency
-    "get_exchange_rate": {
-        "description":     "Returns the exchange rate between two ISO 4217 currency codes.",
-        "required":        ["base", "target"],
-        "defaults":        {"base": "USD", "target": "EUR"},
-        "v1_fields":       ["base", "target"],
-        "v2_fields":       ["from_currency", "to_currency"],
-        "v1_schema":       {
-            "base":          "string — ISO 4217 source currency code, e.g. USD",
-            "target":        "string — ISO 4217 target currency code, e.g. EUR",
-        },
-        "v2_schema":       {
-            "from_currency": "string — ISO 4217 source currency code, e.g. USD",
-            "to_currency":   "string — ISO 4217 target currency code, e.g. EUR",
-        },
-        "expected_result": ["base", "target", "rate"],
-        "result_ranges":   {"rate": (0.000001, 100_000)},
-        "cascade":         None,
-    },
-    # V1: symbol        V2: ticker
-    "get_stock_price": {
-        "description":     "Returns the current market price for a stock.",
-        "required":        ["symbol"],
-        "defaults":        {"symbol": "AAPL"},
-        "v1_fields":       ["symbol"],
-        "v2_fields":       ["ticker"],
-        "v1_schema":       {"symbol": "string — stock ticker symbol in UPPERCASE, e.g. AAPL"},
-        "v2_schema":       {"ticker": "string — stock ticker symbol in UPPERCASE, e.g. AAPL"},
-        "expected_result": ["symbol", "price", "currency"],
-        "result_ranges":   {"price": (0.001, 1_000_000)},
-        "cascade":         None,
-    },
-}
+        "docs_url":        _info.get("docs_url"),
+        "base_url":        _info.get("base_url"),
+    }
+
+log.info("Interceptor registry: %d tools from api_registry", len(TOOL_REGISTRY))
 
 # Tracks which schema version the server is currently using.
-# Bumped to "v2" the first time a drift error is received.
 _server_schema_version: Dict[str, str] = {"version": "v1"}
 
 
@@ -283,44 +228,19 @@ def _args_satisfy_schema(tool: str, args: Dict[str, Any], version: str) -> bool:
 
 class SchemaHealer:
     """
-    SBSA-powered field-name repair (replaces LLM-based healing).
+    SBSA-powered deterministic field-name repair.
 
-    Uses semantic embeddings + Hungarian algorithm for deterministic,
-    fast (~30–50ms), zero-token parameter mapping.
+    Uses sentence-transformers + Hungarian Algorithm instead of LLM inference.
+    Runs in <100ms. No probabilistic guessing.
+
+    SHORT-CIRCUIT: if all required fields already match, args pass through unchanged.
     """
 
-    @classmethod
-    def _initialize_discovery(cls):
-        """
-        Lazy initialization of MCPDiscovery after TOOL_REGISTRY exists.
-        This avoids circular initialization issues during module load.
-        """
-        global _sbsa_discovery
-        if _sbsa_discovery is None:
-            _sbsa_discovery = MCPDiscovery(TOOL_REGISTRY)
+    # Store last alignment report for analytics
+    last_report: Optional[Dict[str, Any]] = None
 
     @classmethod
-    def heal(
-        cls,
-        tool: str,
-        raw_args: Dict[str, Any],
-        force_version: str = None
-    ) -> Dict[str, Any]:
-        """
-        Heal schema mismatches using SBSA algorithm.
-
-        Args:
-            tool: Tool name (e.g., "get_weather")
-            raw_args: Arguments sent by the client
-            force_version: Optional override schema version ("v1" or "v2")
-
-        Returns:
-            Dict with corrected argument field names.
-        """
-
-        # Ensure discovery is initialized
-        cls._initialize_discovery()
-
+    def heal(cls, tool: str, raw_args: Dict[str, Any], force_version: str = None) -> Dict[str, Any]:
         info = TOOL_REGISTRY.get(tool)
         if info is None:
             log.warning("  SchemaHealer | unknown tool '%s' — passing through", tool)
@@ -330,27 +250,17 @@ class SchemaHealer:
         if not info["required"]:
             return {}
 
-        # Determine schema version
-        version = force_version or _server_schema_version["version"]
+        version       = force_version or _server_schema_version["version"]
+        schema        = info.get(f"{version}_schema") or info.get("v1_schema", {})
+        server_fields = info.get(f"{version}_fields") or list(schema.keys())
 
-        # Get required schema fields
-        required_fields = _sbsa_discovery.get_schema(tool, version)
-        if not required_fields:
-            log.warning(
-                "  SchemaHealer | no schema found for '%s' version=%s",
-                tool, version
-            )
-            return raw_args
-
-        # Filter internal metadata fields
-        agent_fields = [k for k in raw_args.keys() if not k.startswith("_")]
-
-        # Skip healing if schema requirements are already satisfied
-        if all(str(raw_args.get(f, "")).strip() for f in required_fields):
+        # Short-circuit: args already match the current server schema
+        if server_fields and all(str(raw_args.get(f, "")).strip() for f in server_fields):
             log.info(
                 "  SchemaHealer | args already valid for %s — pass-through  %s",
                 version, raw_args
             )
+            cls.last_report = None
             return raw_args
 
         # ──────────────────────────────────────────────
@@ -358,67 +268,35 @@ class SchemaHealer:
         # ──────────────────────────────────────────────
 
         log.info(
-            "  SchemaHealer[SBSA] | healing tool='%s' schema=%s raw=%s",
-            tool, version, raw_args
+            "  SchemaHealer | SBSA healing '%s'  schema=%s  raw=%s",
+            tool, version, raw_args,
         )
 
-        start_time = time.time()
+        # Run deterministic SBSA alignment
+        agent_keys = list(raw_args.keys())
 
-        mapping = _sbsa_engine.find_mapping(agent_fields, required_fields)
+        # Get descriptions from both schema versions for semantic enrichment
+        # Agent sent v1-style keys, API expects v2-style keys (or vice versa)
+        v1_schema = info.get("v1_schema", {})
+        v2_schema = info.get("v2_schema", {})
+        # Agent descriptions: try the opposite version (agent is likely using the old one)
+        agent_desc = v1_schema if version == "v2" else v2_schema
+        api_desc = schema  # current version's schema has the descriptions
 
-        latency_ms = (time.time() - start_time) * 1000
-
-        # If SBSA fails to find a confident mapping
-        if not mapping:
-            log.warning(
-                "  SchemaHealer[SBSA] | no valid mapping found "
-                "(threshold=%.2f)",
-                _sbsa_engine.threshold
-            )
-
-            fallback = dict(info["defaults"])
-            fallback.update(raw_args)
-            return fallback
-
-        # Apply mapping
-        healed = {}
-
-        for agent_key, value in raw_args.items():
-            api_key = mapping.get(agent_key, agent_key)
-            healed[api_key] = value
-
-        log.info(
-            "  SchemaHealer[SBSA] | healed in %.1fms mapping=%s result=%s",
-            latency_ms,
-            mapping,
-            healed
+        cls.last_report = sbsa_engine.get_alignment_report(
+            agent_keys, server_fields, agent_desc, api_desc,
         )
 
-        # ──────────────────────────────────────────────
-        # Validate required fields
-        # ──────────────────────────────────────────────
+        healed = sbsa_engine.heal(
+            agent_args=raw_args,
+            target_fields=server_fields,
+            defaults=info.get("defaults", {}),
+            agent_descriptions=agent_desc,
+            api_descriptions=api_desc,
+        )
 
-        missing = [
-            field for field in required_fields
-            if not str(healed.get(field, "")).strip()
-        ]
-
-        if missing:
-            log.warning(
-                "  SchemaHealer[SBSA] | missing required fields after healing: %s",
-                missing
-            )
-
-            for field in missing:
-                if field in info["defaults"]:
-                    healed[field] = info["defaults"][field]
-
-                    log.info(
-                        "  SchemaHealer[SBSA] | filled %s with default: %s",
-                        field,
-                        healed[field]
-                    )
-
+        log.info("  SchemaHealer | SBSA healed -> %s  (%.1fms)",
+                 healed, cls.last_report["elapsed_ms"])
         return healed
 
 
@@ -529,46 +407,15 @@ class TimeoutRecovery:
         attempt: int, original_req: dict,
     ) -> Tuple[bool, dict]:
         cls._say(cls._YLW, "⏱ ", f"[{tool}]  {error_type.upper()} attempt {attempt}/{MAX_RETRIES}")
-        cls._say(cls._CYN, "   ", "Consulting LLM — retry / fallback / fail …")
 
-        prompt = f"""You are a fault-recovery agent for an API proxy.
-Tool: {tool}  |  Attempt: {attempt}/{MAX_RETRIES}
-Error type: {error_type}
-Error: {error_message}
-
-Choose ONE action and respond ONLY with valid JSON:
-  {{"action": "retry",    "reason": "<why>"}}
-  {{"action": "fallback", "reason": "<why>", "result": {{...plausible stub...}}}}
-  {{"action": "fail",     "reason": "<why>"}}
-"""
-        decision = _llm(prompt, label=f"recovery/{tool}")
-
-        if decision is None:
-            if attempt < MAX_RETRIES:
-                cls._say(cls._YLW, "⚠ ", "LLM unavailable — defaulting to retry")
-                cls._wait(attempt, tool)
-                return True, {}
-            return False, cls._make_error(original_req, error_message, error_type)
-
-        action = decision.get("action", "fail")
-        reason = decision.get("reason", "")
-
-        if action == "retry" and attempt < MAX_RETRIES:
-            cls._say(cls._YLW, "↻ ", f"[{tool}]  RETRY — {reason}")
+        # Deterministic retry policy — no LLM call
+        if attempt < MAX_RETRIES:
+            cls._say(cls._YLW, "↻ ", f"[{tool}]  RETRY — attempt {attempt}/{MAX_RETRIES}, {error_type} is retryable")
             cls._wait(attempt, tool)
             return True, {}
 
-        if action == "fallback":
-            stub = dict(decision.get("result") or {})
-            stub["_interceptor_warning"] = f"Fallback — {error_type}: {reason}"
-            log.warning("  TimeoutRecovery | fallback stub: %s", stub)
-            return False, {
-                "jsonrpc": "2.0", "id": original_req.get("id"),
-                "result":  {"structuredContent": stub, "isError": False},
-            }
-
-        cls._say(cls._RED, "✖ ", f"[{tool}]  FAIL — {reason or error_message}")
-        return False, cls._make_error(original_req, f"{error_type}: {reason or error_message}", error_type)
+        cls._say(cls._RED, "✖ ", f"[{tool}]  FAIL — exhausted {MAX_RETRIES} retries for {error_type}")
+        return False, cls._make_error(original_req, f"{error_type}: {error_message}", error_type)
 
     @staticmethod
     def _wait(attempt: int, tool: str = "") -> None:
@@ -702,11 +549,18 @@ def maybe_cascade(
 
     log.info("  Cascade | %s -> %s  args=%s  depth=%d", tool, next_tool, next_args, depth)
 
+    # Heal cascade args through the same SBSA pipeline
+    version = _server_schema_version["version"]
+    healed_args = SchemaHealer.heal(next_tool, next_args, force_version=version)
+    healed_args = strip_extra_fields(next_tool, healed_args, version)
+    if healed_args != next_args:
+        log.info("  Cascade | healed args: %s -> %s", next_args, healed_args)
+
     try:
         next_resp = server_mgr.send({
             "jsonrpc": "2.0", "id": original_req.get("id"),
             "method":  "tools/call",
-            "params":  {"name": next_tool, "arguments": next_args},
+            "params":  {"name": next_tool, "arguments": healed_args},
         })
         if "result" in next_resp:
             next_data   = next_resp["result"].get("structuredContent", next_resp["result"])
@@ -730,35 +584,45 @@ def maybe_cascade(
 
 def reassess_result(tool: str, arguments: Dict[str, Any], result: Any) -> Any:
     """
-    Final LLM sanity check. Skipped if a prior stage already annotated a warning
-    to avoid double-flagging results that were partially repaired.
+    Deterministic structural validation using TOOL_REGISTRY metadata.
+    Checks expected fields and value ranges — no LLM call.
     """
     if isinstance(result, dict) and "_interceptor_warning" in result:
         log.info("  reassess_result | skipping — already annotated")
         return result
 
-    prompt = f"""You are a quality-assurance agent for API tool results.
-Tool: {tool}  |  Args: {json.dumps(arguments)}  |  Result: {json.dumps(result)}
-
-Is this result correct and complete? Check: expected fields present? Values plausible
-(non-zero prices, real city names, valid ISO currency codes, reasonable temperatures)?
-
-Respond ONLY with valid JSON:
-  {{"ok": true}}
-  {{"ok": false, "issue": "<concise description>"}}
-"""
-    assessment = _llm(prompt, label=f"reassess/{tool}")
-    if assessment is None:
+    info = TOOL_REGISTRY.get(tool)
+    if not info:
         return result
 
-    if not assessment.get("ok", True):
-        issue = assessment.get("issue", "interceptor flagged a potential issue")
-        log.warning("  reassess_result | ⚠  %s", issue)
+    issues = []
+
+    # Check expected fields
+    expected = info.get("expected_result", [])
+    if expected and isinstance(result, dict):
+        missing = [f for f in expected if f not in result]
+        if missing:
+            issues.append(f"missing expected fields: {missing}")
+
+    # Check value ranges
+    ranges = info.get("result_ranges", {})
+    if isinstance(result, dict):
+        for field, (lo, hi) in ranges.items():
+            val = result.get(field)
+            if val is not None:
+                try:
+                    num = float(val)
+                    if not (lo <= num <= hi):
+                        issues.append(f"{field}={num} outside expected range [{lo}, {hi}]")
+                except (ValueError, TypeError):
+                    pass
+
+    if issues:
+        warning = "; ".join(issues)
+        log.warning("  reassess_result | ⚠  %s", warning)
         if isinstance(result, dict):
             result = dict(result)
-            result["_interceptor_warning"] = issue
-        else:
-            result = {"_interceptor_warning": issue, "_raw": result}
+            result["_interceptor_warning"] = warning
     else:
         log.info("  reassess_result | ✓ result looks OK")
 
@@ -823,6 +687,13 @@ class ProxySession:
                 self._tool_call_pipeline(req)
                 return
 
+            # Intercept set_drift to reset our schema version tracker
+            if method == "set_drift":
+                drift_active = req.get("params", {}).get("active", False)
+                _server_schema_version["version"] = "v1"
+                log.info("DRIFT TOGGLED → %s  (interceptor schema reset to v1)",
+                         "ON 🔴" if drift_active else "OFF 🟢")
+
             log.info("pass-through  method=%s  id=%s", method, req.get("id"))
             self._send_client(self._forward_to_server(req))
 
@@ -857,6 +728,7 @@ class ProxySession:
         # Stage 2: Schema healing + value normalisation (BEFORE strip)
         if _args_satisfy_schema(tool_name, args, version):
             healed = args
+            SchemaHealer.last_report = None
             log.info("  SchemaHealer | args already valid — pass-through  %s", healed)
         else:
             healed = SchemaHealer.heal(tool_name, args)
@@ -906,6 +778,33 @@ class ProxySession:
 
         self._send_client(resp)
         outcome = "success" if "result" in resp else _classify_error(resp)
+
+        # Analytics: record pipeline event with SBSA report
+        analytics_logger.record_pipeline_event(
+            tool=tool_name,
+            model=LLM_MODEL,
+            outcome=outcome,
+            total_elapsed_s=time.monotonic() - pipeline_start,
+            sbsa_report=SchemaHealer.last_report,
+        )
+        if SchemaHealer.last_report:
+            rpt = SchemaHealer.last_report
+            info = TOOL_REGISTRY.get(tool_name, {})
+            analytics_logger.record_healing_event(
+                tool=tool_name,
+                model=LLM_MODEL,
+                domain=info.get("category", "unknown"),
+                agent_keys=rpt.get("agent_keys", []),
+                api_keys=rpt.get("api_keys", []),
+                mapping=rpt.get("mapping", {}),
+                similarity_scores=rpt.get("similarity_scores", {}),
+                cost_matrix=rpt.get("cost_matrix", []),
+                sbsa_elapsed_ms=rpt.get("elapsed_ms", 0),
+                healed_successfully=outcome == "success",
+                threshold=rpt.get("threshold", 0.4),
+                schema_version=version,
+            )
+
         log.info(
             "PIPELINE END  tool=%s  outcome=%s  total=%.2fs",
             tool_name, outcome, time.monotonic() - pipeline_start,

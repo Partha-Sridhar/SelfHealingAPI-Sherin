@@ -1,0 +1,3 @@
+model,baseline_success_nodrift,baseline_success_drift,sbsa_success_nodrift,sbsa_success_drift,recovery_rate_improvement,avg_total_ms_baseline,avg_total_ms_sbsa,avg_llm_route_ms,avg_sbsa_heal_ms,total_tests,natural_mismatches,mismatch_rate,healed_count,tokens_saved_by_sbsa,cost_saved_by_sbsa,token_savings_pct,sbsa_steps,react_steps,step_efficiency_gain,tool_accuracy
+groq/llama-3.3-70b-versatile,100.0,8.3,91.7,66.7,58.4,1062.5,4116.5,1699.2,4974.5,48,11,22.9,8,3160,0.002004,100.0,1,3,3x → 1x,93.8
+ollama/llama3,58.3,33.3,100.0,91.7,58.4,4798.7,4625.9,2668.7,4939.8,48,23,47.9,10,4290,0.0,100.0,1,3,3x → 1x,100.0

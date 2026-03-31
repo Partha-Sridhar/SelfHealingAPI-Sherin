@@ -1,45 +1,13 @@
 """
-MCP Tool Server — with Schema Drift Simulator
-=============================================
+MCP Tool Server — 18 Real APIs + Schema Drift Simulator
+========================================================
 Communicates over stdin/stdout (JSON-RPC 2.0).
 
-SCHEMA DRIFT
-────────────
-Schema drift happens when a server is "upgraded" but clients were built
-against the old field names. This server simulates that by supporting
-two schema versions that can be switched live.
-
-  V1 (original) — field names the LLM/client was trained on
-  V2 (drifted)  — new field names after a server "upgrade"
-
-V1 → V2 field renames (what breaks without the interceptor)
-────────────────────────────────────────────────────────────
-  get_weather      : "city"    → "location_name"
-  get_country_info : "country" → "country_name"
-  get_exchange_rate: "base"    → "from_currency",  "target" → "to_currency"
-  get_stock_price  : "symbol"  → "ticker"
-
-Toggle drift live via a special JSON-RPC method:
-  {"jsonrpc":"2.0","id":99,"method":"set_drift","params":{"active":true}}
-  {"jsonrpc":"2.0","id":99,"method":"set_drift","params":{"active":false}}
-
-Or pre-enable at startup:
-  SCHEMA_DRIFT=1 python mcp_server.py
-
-WITHOUT interceptor: V2 calls with V1 args fail immediately (schema error).
-WITH    interceptor: the LLM reads the intent and maps args correctly every time.
-
-Error taxonomy (error_type field on every error response)
-─────────────────────────────────────────────────────────
-  schema  — required arg missing or wrong field name
-  drift   — drift is active; caller used old (V1) field names
-  timeout — upstream API timed out
-  network — connection error
-  api     — upstream returned non-200
-  parse   — unexpected response shape
-  unknown — anything else
+Serves 18 real-world APIs across 17 domains from api_registry.py.
+Supports live V1↔V2 schema drift toggling for benchmarking.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -49,433 +17,343 @@ import time
 import requests
 from requests.exceptions import ConnectionError as ReqConnectionError, ReadTimeout, Timeout
 
-# ═══════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════
+from api_registry import API_REGISTRY
 
 HTTP_TIMEOUT_S = 8
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[server] %(levelname)s  %(message)s",
-    stream=sys.stderr,
-)
+logging.basicConfig(level=logging.INFO, format="[server] %(levelname)s  %(message)s", stream=sys.stderr)
 log = logging.getLogger("server")
 
-
 # ═══════════════════════════════════════════════════════════════
-# DRIFT STATE  (mutable — toggled live via set_drift method)
+# DRIFT STATE
 # ═══════════════════════════════════════════════════════════════
 
 _state = {"drift": bool(os.environ.get("SCHEMA_DRIFT", ""))}
-
-
-def drift_active() -> bool:
-    return _state["drift"]
-
+def drift_active(): return _state["drift"]
 
 # ═══════════════════════════════════════════════════════════════
-# SCHEMA VERSIONS
+# BUILD SCHEMAS FROM REGISTRY
 # ═══════════════════════════════════════════════════════════════
 
-# V1 — original field names (what the LLM was trained on)
-_SCHEMAS_V1 = {
-    "get_bitcoin_price": {
-        "description": "Get the current Bitcoin price in USD. No arguments needed.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
-    },
-    "get_weather": {
-        "description": "Get current weather for a city.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"city": {"type": "string", "description": "City name"}},
-            "required": ["city"],
-        },
-    },
-    "get_country_info": {
-        "description": "Get facts about a country.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"country": {"type": "string", "description": "Country name"}},
-            "required": ["country"],
-        },
-    },
-    "get_exchange_rate": {
-        "description": "Get the exchange rate between two currencies.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "base":   {"type": "string", "description": "Base currency, e.g. USD"},
-                "target": {"type": "string", "description": "Target currency, e.g. EUR"},
-            },
-            "required": ["base", "target"],
-        },
-    },
-    "get_stock_price": {
-        "description": "Get the current price for a stock.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"symbol": {"type": "string", "description": "Ticker symbol, e.g. AAPL"}},
-            "required": ["symbol"],
-        },
-    },
-}
+def _build_schemas(version):
+    schemas = {}
+    for name, info in API_REGISTRY.items():
+        s = info[f"{version}_schema"]
+        props = {}
+        required = []
+        for pname, pinfo in s.items():
+            props[pname] = {"type": pinfo.get("type", "string"), "description": pinfo.get("description", "")}
+            if pinfo.get("required", False):
+                required.append(pname)
+        schemas[name] = {
+            "description": info["description"],
+            "inputSchema": {"type": "object", "properties": props, "required": required},
+        }
+    return schemas
 
-# V2 — drifted field names (simulates a server "upgrade")
-_SCHEMAS_V2 = {
-    "get_bitcoin_price": _SCHEMAS_V1["get_bitcoin_price"],   # unchanged
-    "get_weather": {
-        "description": "Get current weather for a location.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"location_name": {"type": "string", "description": "Name of the city or location"}},
-            "required": ["location_name"],
-        },
-    },
-    "get_country_info": {
-        "description": "Get facts about a country.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"country_name": {"type": "string", "description": "Full country name"}},
-            "required": ["country_name"],
-        },
-    },
-    "get_exchange_rate": {
-        "description": "Get the exchange rate between two currencies.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "from_currency": {"type": "string", "description": "Source currency code, e.g. USD"},
-                "to_currency":   {"type": "string", "description": "Target currency code, e.g. EUR"},
-            },
-            "required": ["from_currency", "to_currency"],
-        },
-    },
-    "get_stock_price": {
-        "description": "Get the current price for a stock.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"ticker": {"type": "string", "description": "Stock ticker symbol, e.g. AAPL"}},
-            "required": ["ticker"],
-        },
-    },
-}
+_SCHEMAS_V1 = _build_schemas("v1")
+_SCHEMAS_V2 = _build_schemas("v2")
 
-# Field mapping: V1 name → V2 name (used for drift detection hints in errors)
-_DRIFT_MAP = {
-    "get_weather":       {"city":   "location_name"},
-    "get_country_info":  {"country": "country_name"},
-    "get_exchange_rate": {"base":   "from_currency", "target": "to_currency"},
-    "get_stock_price":   {"symbol": "ticker"},
-}
-
-
-def active_schemas() -> dict:
+def active_schemas():
     return _SCHEMAS_V2 if drift_active() else _SCHEMAS_V1
 
+log.info("Loaded %d tools from api_registry", len(API_REGISTRY))
 
 # ═══════════════════════════════════════════════════════════════
-# STRUCTURED ERROR
+# ERRORS
 # ═══════════════════════════════════════════════════════════════
 
 class ToolError(Exception):
-    def __init__(self, message: str, error_type: str = "unknown"):
+    def __init__(self, message, error_type="unknown"):
         super().__init__(message)
         self.error_type = error_type
 
-
-# ═══════════════════════════════════════════════════════════════
-# HTTP HELPER
-# ═══════════════════════════════════════════════════════════════
-
-def _http_get(url: str, params: dict = None, label: str = "") -> dict:
-    log.info("  %s → GET %s  params=%s", label, url, params)
+def _http_get(url, params=None, headers=None, label=""):
+    log.info("  %s → GET %s", label, url)
     try:
-        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_S)
+        r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_S)
         if r.status_code != 200:
-            raise ToolError(f"API returned HTTP {r.status_code} from {url}", error_type="api")
+            raise ToolError(f"HTTP {r.status_code} from {url}", error_type="api")
         return r.json()
-    except (Timeout, ReadTimeout) as exc:
-        raise ToolError(f"timeout calling {url}: {exc}", error_type="timeout") from exc
-    except ReqConnectionError as exc:
-        raise ToolError(f"network error calling {url}: {exc}", error_type="network") from exc
+    except (Timeout, ReadTimeout) as e:
+        raise ToolError(f"timeout: {e}", error_type="timeout") from e
+    except ReqConnectionError as e:
+        raise ToolError(f"network error: {e}", error_type="network") from e
     except ToolError:
         raise
-    except Exception as exc:
-        raise ToolError(str(exc), error_type="unknown") from exc
-
+    except Exception as e:
+        raise ToolError(str(e), error_type="unknown") from e
 
 # ═══════════════════════════════════════════════════════════════
-# ARGUMENT EXTRACTION — version-aware
+# ARGUMENT EXTRACTION — drift-aware
 # ═══════════════════════════════════════════════════════════════
 
-def _extract(arguments: dict, tool: str, v1_field: str, v2_field: str) -> str:
-    """
-    Pull a value from arguments regardless of whether the caller sent
-    the V1 or V2 field name.
-
-    If drift is active and the caller used the OLD (V1) name, raise a
-    drift error — this is exactly what breaks without the interceptor.
-    """
+def _extract(arguments, tool, v1_field, v2_field):
     if drift_active():
-        # Server now only accepts V2 names
-        val = arguments.get(v2_field, "").strip()
+        val = arguments.get(v2_field, "")
+        if isinstance(val, str): val = val.strip()
         if not val:
-            # Check if they sent the old V1 name — give a specific drift error
-            old_val = arguments.get(v1_field, "").strip()
-            if old_val:
-                raise ToolError(
-                    f"[{tool}] Schema drift detected: field '{v1_field}' is no longer accepted. "
-                    f"The server was upgraded and now expects '{v2_field}' instead. "
-                    f"You sent: {arguments}",
-                    error_type="drift",
-                )
+            schema = active_schemas().get(tool, {}).get("inputSchema", {})
+            required = schema.get("required", [])
             raise ToolError(
-                f"[{tool}] Missing required field '{v2_field}'. "
-                f"Got: {arguments}",
-                error_type="schema",
+                f"[{tool}] Bad Request: missing required field(s): {required}. "
+                f"Received: {list(arguments.keys())}",
+                error_type="drift",
             )
         return val
     else:
-        # V1 mode — only accept original names
-        val = arguments.get(v1_field, "").strip()
+        val = arguments.get(v1_field, "")
+        if isinstance(val, str): val = val.strip()
         if not val:
-            raise ToolError(
-                f"[{tool}] Missing required field '{v1_field}'. Got: {arguments}",
-                error_type="schema",
-            )
+            raise ToolError(f"[{tool}] Missing required field '{v1_field}'. Got: {arguments}", error_type="schema")
         return val
 
+def _extract_optional(arguments, v1_field, v2_field, default=None):
+    if drift_active():
+        return arguments.get(v2_field, default)
+    return arguments.get(v1_field, default)
 
 # ═══════════════════════════════════════════════════════════════
-# TOOL IMPLEMENTATIONS
+# TOOL IMPLEMENTATIONS — all 18 real APIs
 # ═══════════════════════════════════════════════════════════════
+
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "97d16b7b82msh11e4e27d5d98ac8p14faa6jsn99dabf4a5bec")
 
 _CITIES = {
-    "delhi":         (28.6139,  77.2090),
-    "london":        (51.5074,  -0.1278),
-    "new york":      (40.7128, -74.0060),
-    "new york city": (40.7128, -74.0060),
-    "nyc":           (40.7128, -74.0060),
-    "tokyo":         (35.6762, 139.6503),
-    "mumbai":        (19.0760,  72.8777),
-    "paris":         (48.8566,   2.3522),
-    "berlin":        (52.5200,  13.4050),
-    "sydney":       (-33.8688, 151.2093),
-    "dubai":         (25.2048,  55.2708),
-    "singapore":     (1.3521,  103.8198),
-    "bangalore":    (12.9716,   77.5946),
-    "bengaluru":    (12.9716,   77.5946),
+    "delhi": (28.6139, 77.2090), "london": (51.5074, -0.1278),
+    "new york": (40.7128, -74.0060), "tokyo": (35.6762, 139.6503),
+    "mumbai": (19.0760, 72.8777), "paris": (48.8566, 2.3522),
+    "berlin": (52.5200, 13.4050), "sydney": (-33.8688, 151.2093),
+    "dubai": (25.2048, 55.2708), "singapore": (1.3521, 103.8198),
 }
 
-
-def get_bitcoin_price() -> dict:
-    data = _http_get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": "bitcoin", "vs_currencies": "usd"},
-        label="get_bitcoin_price",
-    )
-    try:
-        return {"bitcoin_usd": data["bitcoin"]["usd"]}
-    except KeyError as exc:
-        raise ToolError(f"Unexpected response shape: {exc}", error_type="parse") from exc
-
-
-def get_weather(arguments: dict) -> dict:
-    city = _extract(arguments, "get_weather", v1_field="city", v2_field="location_name")
+def _call_get_weather(args):
+    city = _extract(args, "get_weather", "city", "location_name")
     lat, lon = _CITIES.get(city.lower(), (28.6139, 77.2090))
-    time.sleep(20)
-    data = _http_get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={"latitude": lat, "longitude": lon, "current_weather": True},
-        label=f"get_weather({city})",
-    )
-    try:
-        cw = data["current_weather"]
-        return {
-            "city":          city,
-            "temperature_c": cw["temperature"],
-            "windspeed_kmh": cw["windspeed"],
-            "weathercode":   cw.get("weathercode"),
-        }
-    except KeyError as exc:
-        raise ToolError(f"Unexpected weather response: {exc}", error_type="parse") from exc
+    data = _http_get("https://api.open-meteo.com/v1/forecast",
+                     params={"latitude": lat, "longitude": lon, "current_weather": True}, label="weather")
+    cw = data["current_weather"]
+    return {"city": city, "temperature_c": cw["temperature"], "windspeed_kmh": cw["windspeed"]}
 
+def _call_get_country_info(args):
+    country = _extract(args, "get_country_info", "country", "country_name")
+    data = _http_get(f"https://restcountries.com/v3.1/name/{country}", params={"fullText": "true"}, label="country")
+    d = data[0]
+    return {"country": d["name"]["common"], "capital": d["capital"][0], "population": d["population"], "region": d["region"]}
 
-def get_country_info(arguments: dict) -> dict:
-    country = _extract(arguments, "get_country_info", v1_field="country", v2_field="country_name")
-    data = _http_get(
-        f"https://restcountries.com/v3.1/name/{country}",
-        label=f"get_country_info({country})",
-    )
-    try:
-        d = data[0]
-        return {
-            "country":    d["name"]["common"],
-            "capital":    d["capital"][0],
-            "population": d["population"],
-            "region":     d["region"],
-            "subregion":  d.get("subregion", ""),
-            "currency": d.get("currency", "")
-        }
-    except (KeyError, IndexError) as exc:
-        raise ToolError(f"Unexpected country response: {exc}", error_type="parse") from exc
+def _call_get_crypto_price(args):
+    coin = _extract(args, "get_crypto_price", "coin", "crypto_id")
+    currency = _extract(args, "get_crypto_price", "currency", "vs_currency")
+    data = _http_get("https://api.coingecko.com/api/v3/simple/price",
+                     params={"ids": coin.lower(), "vs_currencies": currency.lower()}, label="crypto")
+    return {"coin": coin, "currency": currency, "price": data[coin.lower()][currency.lower()]}
 
+def _call_get_exchange_rate(args):
+    base = _extract(args, "get_exchange_rate", "base", "from_currency")
+    target = _extract(args, "get_exchange_rate", "target", "to_currency")
+    data = _http_get(f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/{base.lower()}.json", label="exchange")
+    return {"base": base.upper(), "target": target.upper(), "rate": data[base.lower()][target.lower()]}
 
-def get_exchange_rate(arguments: dict) -> dict:
-    base   = _extract(arguments, "get_exchange_rate", v1_field="base",   v2_field="from_currency")
-    target = _extract(arguments, "get_exchange_rate", v1_field="target", v2_field="to_currency")
-    data = _http_get(
-        "https://api.exchangerate.host/convert",
-        params={"from": base.upper(), "to": target.upper()},
-        label=f"get_exchange_rate({base}/{target})",
-    )
-    try:
-        return {"base": base.upper(), "target": target.upper(), "rate": data["result"]}
-    except KeyError as exc:
-        raise ToolError(f"Unexpected exchange-rate response: {exc}", error_type="parse") from exc
+def _call_search_books(args):
+    query = _extract(args, "search_books", "query", "search_term")
+    limit = _extract_optional(args, "limit", "max_results", 3)
+    data = _http_get("https://openlibrary.org/search.json", params={"q": query, "limit": limit}, label="books")
+    books = [{"title": b.get("title"), "author": b.get("author_name", ["Unknown"])[0], "year": b.get("first_publish_year")}
+             for b in data.get("docs", [])[:3]]
+    return {"query": query, "results": books, "total": data.get("numFound", 0)}
 
+def _call_get_joke(args):
+    category = _extract(args, "get_joke", "category", "joke_type")
+    data = _http_get(f"https://v2.jokeapi.dev/joke/{category}", label="joke")
+    if data.get("type") == "twopart":
+        return {"category": data["category"], "setup": data["setup"], "delivery": data["delivery"]}
+    return {"category": data.get("category"), "joke": data.get("joke")}
 
-def get_stock_price(arguments: dict) -> dict:
-    symbol = _extract(arguments, "get_stock_price", v1_field="symbol", v2_field="ticker")
-    data = _http_get(
-        "https://query1.finance.yahoo.com/v7/finance/quote",
-        params={"symbols": symbol.upper()},
-        label=f"get_stock_price({symbol})",
-    )
-    try:
-        r = data["quoteResponse"]["result"][0]
-        return {
-            "symbol":       r["symbol"],
-            "price":        r["regularMarketPrice"],
-            "currency":     r["currency"],
-            "exchange":     r.get("fullExchangeName", ""),
-            "market_state": r.get("marketState", ""),
-        }
-    except (KeyError, IndexError) as exc:
-        raise ToolError(f"Unexpected stock response: {exc}", error_type="parse") from exc
+def _call_define_word(args):
+    word = _extract(args, "define_word", "word", "term")
+    data = _http_get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}", label="dictionary")
+    entry = data[0]
+    meanings = [{"part_of_speech": m["partOfSpeech"], "definition": m["definitions"][0]["definition"]}
+                for m in entry.get("meanings", [])[:2]]
+    return {"word": entry["word"], "phonetic": entry.get("phonetic", ""), "meanings": meanings}
 
+def _call_search_universities(args):
+    name = _extract(args, "search_universities", "name", "university_name")
+    country = _extract_optional(args, "country", "country_name")
+    params = {"name": name}
+    if country: params["country"] = country
+    data = _http_get("http://universities.hipolabs.com/search", params=params, label="universities")
+    return {"results": [{"name": u["name"], "country": u["country"], "website": u.get("web_pages", [""])[0]}
+                        for u in data[:5]], "total": len(data)}
+
+def _call_search_cocktail(args):
+    name = _extract(args, "search_cocktail", "name", "drink_name")
+    data = _http_get("https://www.thecocktaildb.com/api/json/v1/1/search.php", params={"s": name}, label="cocktail")
+    drinks = data.get("drinks") or []
+    return {"results": [{"name": d["strDrink"], "category": d.get("strCategory"), "instructions": d.get("strInstructions", "")[:100]}
+                        for d in drinks[:3]]}
+
+def _call_get_trivia(args):
+    category = _extract(args, "get_trivia", "category", "topic_id")
+    difficulty = _extract_optional(args, "difficulty", "level")
+    params = {"amount": 1, "category": category, "type": "multiple"}
+    if difficulty: params["difficulty"] = difficulty
+    data = _http_get("https://opentdb.com/api.php", params=params, label="trivia")
+    if data.get("results"):
+        q = data["results"][0]
+        return {"question": q["question"], "correct_answer": q["correct_answer"],
+                "difficulty": q["difficulty"], "category": q["category"]}
+    return {"error": "No questions found"}
+
+def _call_get_pokemon(args):
+    name = _extract(args, "get_pokemon", "name", "pokemon_name")
+    data = _http_get(f"https://pokeapi.co/api/v2/pokemon/{name.lower()}", label="pokemon")
+    return {"name": data["name"], "id": data["id"],
+            "types": [t["type"]["name"] for t in data["types"]],
+            "height": data["height"], "weight": data["weight"]}
+
+def _call_get_space_photo(args):
+    date = _extract_optional(args, "date", "photo_date")
+    params = {"api_key": "DEMO_KEY"}
+    if date: params["date"] = date
+    data = _http_get("https://api.nasa.gov/planetary/apod", params=params, label="nasa")
+    return {"title": data["title"], "date": data["date"], "explanation": data["explanation"][:200], "url": data.get("url")}
+
+def _call_geolocate_ip(args):
+    ip = _extract(args, "geolocate_ip", "ip", "ip_address")
+    data = _http_get(f"http://ip-api.com/json/{ip}", label="geoip")
+    return {"ip": ip, "country": data["country"], "city": data.get("city"), "lat": data.get("lat"), "lon": data.get("lon"), "isp": data.get("isp")}
+
+def _call_search_team(args):
+    team = _extract(args, "search_team", "team", "team_name")
+    data = _http_get("https://www.thesportsdb.com/api/v1/json/3/searchteams.php", params={"t": team}, label="sports")
+    teams = data.get("teams") or []
+    if teams:
+        t = teams[0]
+        return {"team": t["strTeam"], "sport": t.get("strSport"), "league": t.get("strLeague"),
+                "country": t.get("strCountry"), "description": (t.get("strDescriptionEN") or "")[:200]}
+    return {"error": f"Team '{team}' not found"}
+
+def _call_search_song(args):
+    q = _extract(args, "search_song", "q", "search_query")
+    data = _http_get("https://genius-song-lyrics1.p.rapidapi.com/search/", params={"q": q},
+                     headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": "genius-song-lyrics1.p.rapidapi.com"}, label="genius")
+    hits = data.get("hits", [])[:3]
+    return {"query": q, "results": [{"title": h["result"]["title"], "artist": h["result"]["primary_artist"]["name"]}
+                                     for h in hits if "result" in h]}
+
+def _call_get_dog_image(args):
+    breed = _extract(args, "get_dog_image", "breed", "dog_breed")
+    data = _http_get(f"https://dog.ceo/api/breed/{breed.lower()}/images/random", label="dog")
+    return {"breed": breed, "image_url": data.get("message")}
+
+def _call_get_activity(args):
+    atype = _extract(args, "get_activity", "type", "activity_type")
+    data = _http_get("https://bored-api.appbrewery.com/filter", params={"type": atype}, label="bored")
+    if isinstance(data, list) and data:
+        a = data[0]
+        return {"activity": a.get("activity"), "type": a.get("type"), "participants": a.get("participants")}
+    return {"error": f"No activities found for type '{atype}'"}
+
+def _call_predict_age(args):
+    name = _extract(args, "predict_age", "name", "first_name")
+    data = _http_get("https://api.agify.io", params={"name": name}, label="agify")
+    return {"name": data["name"], "predicted_age": data["age"], "count": data["count"]}
 
 # ═══════════════════════════════════════════════════════════════
 # TOOL ROUTER
 # ═══════════════════════════════════════════════════════════════
 
-def call_tool(name: str, arguments: dict) -> dict:
-    if name == "get_bitcoin_price":  return get_bitcoin_price()
-    if name == "get_weather":        return get_weather(arguments)
-    if name == "get_country_info":   return get_country_info(arguments)
-    if name == "get_exchange_rate":  return get_exchange_rate(arguments)
-    if name == "get_stock_price":    return get_stock_price(arguments)
-    raise ToolError(f"Unknown tool: '{name}'", error_type="unknown")
+_TOOL_MAP = {
+    "get_weather": _call_get_weather,
+    "get_country_info": _call_get_country_info,
+    "get_crypto_price": _call_get_crypto_price,
+    "get_exchange_rate": _call_get_exchange_rate,
+    "search_books": _call_search_books,
+    "get_joke": _call_get_joke,
+    "define_word": _call_define_word,
+    "search_universities": _call_search_universities,
+    "search_cocktail": _call_search_cocktail,
+    "get_trivia": _call_get_trivia,
+    "get_pokemon": _call_get_pokemon,
+    "get_space_photo": _call_get_space_photo,
+    "geolocate_ip": _call_geolocate_ip,
+    "search_team": _call_search_team,
+    "search_song": _call_search_song,
+    "get_dog_image": _call_get_dog_image,
+    "get_activity": _call_get_activity,
+    "predict_age": _call_predict_age,
+}
 
+def call_tool(name, arguments):
+    fn = _TOOL_MAP.get(name)
+    if not fn:
+        raise ToolError(f"Unknown tool: '{name}'", error_type="unknown")
+    return fn(arguments)
 
 # ═══════════════════════════════════════════════════════════════
 # JSON-RPC TRANSPORT
 # ═══════════════════════════════════════════════════════════════
 
-def _send(payload: dict):
-    print(json.dumps(payload), flush=True)
-
-
-def _ok(id_, result: dict):
-    _send({"jsonrpc": "2.0", "id": id_, "result": result})
-
-
-def _err(id_, message: str, error_type: str = "unknown", code: int = -32000):
-    _send({
-        "jsonrpc": "2.0",
-        "id": id_,
-        "error": {"code": code, "message": str(message), "error_type": error_type},
-    })
-
-
-# ═══════════════════════════════════════════════════════════════
-# MAIN LOOP
-# ═══════════════════════════════════════════════════════════════
+def _send(p): print(json.dumps(p), flush=True)
+def _ok(id_, result): _send({"jsonrpc": "2.0", "id": id_, "result": result})
+def _err(id_, msg, error_type="unknown", code=-32000):
+    _send({"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": str(msg), "error_type": error_type}})
 
 def main():
-    log.info("mcp_server ready  drift=%s", drift_active())
-    log.info("  V1 fields: city | country | base/target | symbol")
-    log.info("  V2 fields: location_name | country_name | from_currency/to_currency | ticker")
+    log.info("mcp_server ready  drift=%s  tools=%d", drift_active(), len(_TOOL_MAP))
 
     for raw in sys.stdin:
         raw = raw.strip()
-        if not raw:
-            continue
+        if not raw: continue
         req = {}
         try:
-            req    = json.loads(raw)
+            req = json.loads(raw)
             method = req.get("method")
-            id_    = req.get("id")
+            id_ = req.get("id")
 
-            # ── Standard MCP methods ──────────────────────────
             if method == "initialize":
-                _ok(id_, {
-                    "protocolVersion": "2024-11-05",
-                    "serverInfo": {
-                        "name":    "mcp-tool-server",
-                        "version": "2.0",
-                        "schema_version": "V2 (drifted)" if drift_active() else "V1 (original)",
-                    },
-                    "capabilities": {"tools": {}},
-                })
+                _ok(id_, {"protocolVersion": "2024-11-05",
+                          "serverInfo": {"name": "sbsa-tool-server", "version": "3.0",
+                                         "schema_version": "V2" if drift_active() else "V1",
+                                         "tools_count": len(_TOOL_MAP)},
+                          "capabilities": {"tools": {}}})
 
             elif method == "tools/list":
                 schemas = active_schemas()
                 _ok(id_, {"tools": [{"name": n, **s} for n, s in schemas.items()]})
-                log.info(
-                    "tools/list served  schema_version=%s",
-                    "V2 (drifted)" if drift_active() else "V1 (original)",
-                )
 
             elif method == "tools/call":
-                params    = req.get("params", {})
-                name      = params.get("name")
+                params = req.get("params", {})
+                name = params.get("name")
                 arguments = params.get("arguments", {})
-                schema_v  = "V2" if drift_active() else "V1"
-                log.info("tools/call  tool=%-22s  schema=%s  args=%s", name, schema_v, arguments)
+                log.info("tools/call  tool=%s  schema=%s  args=%s", name, "V2" if drift_active() else "V1", arguments)
                 result = call_tool(name, arguments)
-                log.info("  ✓ success")
                 _ok(id_, {"structuredContent": result, "isError": False})
 
             elif method in ("initialized", "notifications/initialized"):
-                pass  # fire-and-forget
+                pass
 
-            # ── Drift control (for demo/testing) ──────────────
             elif method == "set_drift":
                 active = req.get("params", {}).get("active", False)
                 _state["drift"] = bool(active)
-                status = "V2 DRIFTED 🔴" if _state["drift"] else "V1 ORIGINAL 🟢"
-                log.info("DRIFT TOGGLED → %s", status)
-                _ok(id_, {
-                    "drift_active":    _state["drift"],
-                    "schema_version":  "V2 (drifted)" if _state["drift"] else "V1 (original)",
-                    "v1_fields": {"get_weather": "city", "get_country_info": "country",
-                                  "get_exchange_rate": "base/target", "get_stock_price": "symbol"},
-                    "v2_fields": {"get_weather": "location_name", "get_country_info": "country_name",
-                                  "get_exchange_rate": "from_currency/to_currency", "get_stock_price": "ticker"},
-                })
+                log.info("DRIFT → %s", "ON 🔴" if _state["drift"] else "OFF 🟢")
+                _ok(id_, {"drift_active": _state["drift"]})
 
             elif method == "get_drift_status":
-                _ok(id_, {
-                    "drift_active":   _state["drift"],
-                    "schema_version": "V2 (drifted)" if _state["drift"] else "V1 (original)",
-                    "drift_map":      _DRIFT_MAP,
-                })
+                _ok(id_, {"drift_active": _state["drift"]})
 
             else:
-                _err(id_, f"Unknown method: '{method}'", error_type="unknown", code=-32601)
+                _err(id_, f"Unknown method: '{method}'", code=-32601)
 
         except ToolError as te:
             log.warning("ToolError [%s]: %s", te.error_type, te)
             _err(req.get("id"), str(te), error_type=te.error_type)
         except json.JSONDecodeError as je:
-            log.error("JSON parse error: %s", je)
             _err(None, f"Invalid JSON: {je}", error_type="parse", code=-32700)
         except Exception as exc:
-            log.error("Unhandled error: %s", exc)
-            _err(req.get("id"), str(exc), error_type="unknown")
-
+            log.error("Unhandled: %s", exc, exc_info=True)
+            _err(req.get("id"), str(exc))
 
 if __name__ == "__main__":
     main()
