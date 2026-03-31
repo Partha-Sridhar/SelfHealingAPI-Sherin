@@ -33,6 +33,7 @@ API_REGISTRY = {
             "Temperature in Tokyo right now",
             "Weather in Mumbai",
         ],
+        "cascade": None,
     },
 
     # ── Geography ──
@@ -54,6 +55,11 @@ API_REGISTRY = {
             "Capital of France",
             "Population of India",
         ],
+        "cascade": {
+        "trigger_field": "capital",
+        "next_tool": "get_weather",
+        "arg_map": {"city": "capital"},
+    },
     },
 
     # ── Crypto ──
@@ -77,6 +83,7 @@ API_REGISTRY = {
             "Ethereum price in EUR",
             "What's the price of solana?",
         ],
+        "cascade": None,
     },
 
     # ── Finance ──
@@ -100,6 +107,7 @@ API_REGISTRY = {
             "Exchange rate GBP to JPY",
             "How much is 1 INR in USD?",
         ],
+        "cascade": None,
     },
 
     # ── Books ──
@@ -123,6 +131,7 @@ API_REGISTRY = {
             "Find books by George Orwell",
             "Books about machine learning",
         ],
+        "cascade": None,
     },
 
     # ── Entertainment ──
@@ -144,6 +153,7 @@ API_REGISTRY = {
             "Give me a random joke",
             "Tell me a pun",
         ],
+        "cascade": None,
     },
 
     # ── Education (Dictionary) ──
@@ -165,6 +175,7 @@ API_REGISTRY = {
             "What does 'ephemeral' mean?",
             "Look up the word 'algorithm'",
         ],
+        "cascade": None,
     },
 
     # ── Education (Universities) ──
@@ -188,6 +199,7 @@ API_REGISTRY = {
             "Find universities in India",
             "Search for Oxford university",
         ],
+         "cascade": None,
     },
 
     # ── Food & Drink ──
@@ -209,6 +221,7 @@ API_REGISTRY = {
             "Search for Mojito recipe",
             "What's in a Cosmopolitan?",
         ],
+         "cascade": None,
     },
 
     # ── Trivia ──
@@ -232,6 +245,7 @@ API_REGISTRY = {
             "Easy sports trivia",
             "Hard history trivia question",
         ],
+         "cascade": None,
     },
 
     # ── Gaming ──
@@ -253,6 +267,7 @@ API_REGISTRY = {
             "Get stats for Charizard",
             "What type is Bulbasaur?",
         ],
+         "cascade": None,
     },
 
     # ── Space ──
@@ -274,6 +289,7 @@ API_REGISTRY = {
             "NASA astronomy picture for 2024-01-01",
             "Space photo of the day",
         ],
+         "cascade": None,
     },
 
     # ── Geolocation ──
@@ -295,6 +311,11 @@ API_REGISTRY = {
             "Geolocate IP 1.1.1.1",
             "What country is 203.0.113.0 from?",
         ],
+        "cascade": {
+        "trigger_field": "country",
+        "next_tool": "get_country_info",
+        "arg_map": {"country": "country"},
+    },
     },
 
     # ── Sports ──
@@ -316,6 +337,7 @@ API_REGISTRY = {
             "Find info about Barcelona FC",
             "Tell me about the Lakers",
         ],
+        "cascade": None,
     },
 
     # ── Music (ToolBench/RapidAPI) ──
@@ -340,6 +362,7 @@ API_REGISTRY = {
             "Find lyrics for Bohemian Rhapsody",
             "Search Taylor Swift on Genius",
         ],
+        "cascade": None,
     },
 
     # ── Animals ──
@@ -361,6 +384,7 @@ API_REGISTRY = {
             "Random husky image",
             "Get a poodle photo",
         ],
+        "cascade": None,
     },
 
     # ── Lifestyle ──
@@ -382,6 +406,7 @@ API_REGISTRY = {
             "I'm bored, give me something educational to do",
             "Suggest a social activity",
         ],
+        "cascade": None,
     },
 
     # ── Data/Demographics ──
@@ -403,7 +428,173 @@ API_REGISTRY = {
             "How old is someone named Priya likely to be?",
             "Age prediction for the name Sarah",
         ],
+        "cascade": None,
     },
+
+    # ─────────────────────────────────────────────
+# 🔹 ADDITIONAL APIs
+# ─────────────────────────────────────────────
+
+"predict_gender": {
+    "domain": "Data",
+    "provider": "Genderize",
+    "description": "Predict gender based on a first name.",
+    "base_url": "https://api.genderize.io",
+    "docs_url": "https://genderize.io/documentation",
+    "openapi_url": None,
+    "v1_schema": {
+        "name": {"type": "string", "description": "First name", "required": True},
+    },
+    "v2_schema": {
+        "first_name": {"type": "string", "description": "Person's first name", "required": True},
+    },
+    "sample_queries": [
+        "Predict gender for the name Alex",
+        "Is the name Priya male or female?",
+        "Gender prediction for John",
+    ],
+    "cascade": None,
+},
+
+"predict_nationality": {
+    "domain": "Data",
+    "provider": "Nationalize",
+    "description": "Predict nationality based on a name.",
+    "base_url": "https://api.nationalize.io",
+    "docs_url": "https://nationalize.io/documentation",
+    "openapi_url": None,
+    "v1_schema": {
+        "name": {"type": "string", "description": "First name", "required": True},
+    },
+    "v2_schema": {
+        "person_name": {"type": "string", "description": "Name of the person", "required": True},
+    },
+    "sample_queries": [
+        "Predict nationality for the name Ahmed",
+        "Which country is the name Maria from?",
+        "Nationality prediction for Raj",
+    ],
+    "cascade": {
+        "trigger_field": "country",
+        "next_tool": "get_country_info",
+        "arg_map": {"country": "country"},
+    },
+},
+
+"reverse_geocode": {
+    "domain": "Geolocation",
+    "provider": "BigDataCloud",
+    "description": "Get location details from latitude and longitude.",
+    "base_url": "https://api.bigdatacloud.net/data/reverse-geocode-client",
+    "docs_url": "https://www.bigdatacloud.com/docs/api/reverse-geocode",
+    "openapi_url": None,
+    "v1_schema": {
+        "lat": {"type": "string", "description": "Latitude", "required": True},
+        "lon": {"type": "string", "description": "Longitude", "required": True},
+    },
+    "v2_schema": {
+        "latitude": {"type": "string", "description": "Latitude coordinate", "required": True},
+        "longitude": {"type": "string", "description": "Longitude coordinate", "required": True},
+    },
+    "sample_queries": [
+        "Where is latitude 40.7128 and longitude -74.0060?",
+        "Location for coordinates 13.0827, 80.2707",
+        "Find place from coordinates 51.5074, -0.1278",
+    ],
+    "cascade": {
+        "trigger_field": "city",
+        "next_tool": "get_weather",
+        "arg_map": {"city": "city"},
+    },
+},
+
+"get_currency_info": {
+    "domain": "Finance",
+    "provider": "REST Countries",
+    "description": "Get currency details of a country.",
+    "base_url": "https://restcountries.com/v3.1/name/{country}",
+    "docs_url": "https://restcountries.com/",
+    "openapi_url": None,
+    "v1_schema": {
+        "country": {"type": "string", "description": "Country name", "required": True},
+    },
+    "v2_schema": {
+        "country_name": {"type": "string", "description": "Full country name", "required": True},
+    },
+    "sample_queries": [
+        "What is the currency of Japan?",
+        "Currency used in Brazil",
+        "Tell me the currency of India",
+    ],
+    "cascade": None,
+},
+
+"get_ip_details": {
+    "domain": "Geolocation",
+    "provider": "ipapi",
+    "description": "Get detailed location info from IP address.",
+    "base_url": "https://ipapi.co/{ip}/json/",
+    "docs_url": "https://ipapi.co/api/#introduction",
+    "openapi_url": None,
+    "v1_schema": {
+        "ip": {"type": "string", "description": "IP address", "required": True},
+    },
+    "v2_schema": {
+        "ip_address": {"type": "string", "description": "IPv4 or IPv6 address", "required": True},
+    },
+    "sample_queries": [
+        "Where is IP 8.8.8.8 located?",
+        "Location details for 1.1.1.1",
+        "Find country for IP 142.250.190.78",
+    ],
+    "cascade": {
+        "trigger_field": "country",
+        "next_tool": "get_country_info",
+        "arg_map": {"country": "country"},
+    },
+},
+
+"get_timezone_time": {
+    "domain": "Utility",
+    "provider": "WorldTimeAPI",
+    "description": "Get current time for a specific timezone.",
+    "base_url": "http://worldtimeapi.org/api/timezone/{zone}",
+    "docs_url": "http://worldtimeapi.org/pages/examples",
+    "openapi_url": None,
+    "v1_schema": {
+        "zone": {"type": "string", "description": "Timezone (e.g., Asia/Kolkata)", "required": True},
+    },
+    "v2_schema": {
+        "timezone": {"type": "string", "description": "Timezone string", "required": True},
+    },
+    "sample_queries": [
+        "Current time in Asia/Kolkata",
+        "What time is it in Europe/London?",
+        "Time in America/New_York",
+    ],
+    "cascade": None,
+},
+
+"get_bank_details": {
+    "domain": "Finance",
+    "provider": "IFSC",
+    "description": "Get bank details using IFSC code.",
+    "base_url": "https://ifsc.razorpay.com/{ifsc}",
+    "docs_url": "https://ifsc.razorpay.com/",
+    "openapi_url": None,
+    "v1_schema": {
+        "ifsc": {"type": "string", "description": "IFSC code", "required": True},
+    },
+    "v2_schema": {
+        "ifsc_code": {"type": "string", "description": "Bank IFSC code", "required": True},
+    },
+    "sample_queries": [
+        "Bank details for IFSC HDFC0001234",
+        "Find bank info using IFSC SBIN0000456",
+        "Details for ICICI IFSC code",
+    ],
+    "cascade":None,
+},
 }
 
 
@@ -414,6 +605,7 @@ def get_domains_summary():
         "Books": "📚", "Entertainment": "😂", "Education": "🎓", "Food & Drink": "🍹",
         "Trivia": "❓", "Gaming": "🎮", "Space": "🚀", "Geolocation": "📍",
         "Sports": "⚽", "Music": "🎵", "Animals": "🐕", "Lifestyle": "🎯", "Data": "📊",
+         "Utility": "⏰","Prediction": "🧠","Banking": "🏦",   
     }
     domains = {}
     for tool_name, info in API_REGISTRY.items():

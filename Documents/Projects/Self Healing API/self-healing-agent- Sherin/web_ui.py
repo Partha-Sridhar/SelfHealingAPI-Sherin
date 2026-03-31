@@ -213,6 +213,8 @@ def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False,
         "healing_steps": [],
         "mode": "interceptor" if use_interceptor else "direct",
         "cascade_data": None,
+        "cascade_summary": None,
+        "cascaded_tools": [],
         "model": model_key,
         "sbsa_report": None,
         "llm_latency_ms": None,
@@ -298,6 +300,14 @@ def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False,
             cascade_keys = [k for k in tool_data if k.startswith("_cascade_")]
             if cascade_keys:
                 result["cascade_data"] = {k: tool_data[k] for k in cascade_keys}
+                # Build cascade summary for UI
+                cascaded_tools = []
+                for key in cascade_keys:
+                    tool_name = key.replace("_cascade_", "").replace("_", " ")
+                    tool_data_short = str(tool_data[key])[:100]
+                    cascaded_tools.append(f"{tool_name}: {tool_data_short}...")
+                result["cascaded_tools"] = cascaded_tools
+                result["cascade_summary"] = f"🔄 Cascade executed ({len(cascade_keys)} tools): " + "; ".join(cascaded_tools)
 
             if use_interceptor:
                 result["healed_args"] = raw_args
@@ -320,13 +330,21 @@ def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False,
                 except Exception:
                     pass
 
-        # Step 3: LLM summarizes the result
+        # Step 3: LLM summarizes the result - preserve full cascade data
         step("summarize", "LLM generating answer...")
-        clean_data = (
-            {k: v for k, v in tool_data.items() if not k.startswith("_")}
-            if isinstance(tool_data, dict) else tool_data
-        )
-        result["answer"] = adapter.summarize(question, clean_data)
+        clean_data = tool_data if isinstance(tool_data, dict) else tool_data
+        result["raw_tool_data"] = clean_data  # Preserve full data for UI
+        
+        # Better summarize prompt for cascades
+        summary_prompt = f"""Question: {question}
+
+Tool result (includes cascade chain if executed):
+{json.dumps(clean_data, indent=2)}
+
+Answer naturally using all available information, including any cascaded results.
+Include key facts. Be concise but complete."""
+        
+        result["answer"] = adapter.summarize(summary_prompt, {})  # Use prompt directly
         return result
 
     except Exception as e:

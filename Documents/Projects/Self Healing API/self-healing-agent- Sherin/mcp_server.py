@@ -260,6 +260,105 @@ def _call_predict_age(args):
     data = _http_get("https://api.agify.io", params={"name": name}, label="agify")
     return {"name": data["name"], "predicted_age": data["age"], "count": data["count"]}
 
+# ───────── NEW APIs ─────────
+
+def _call_get_timezone_time(args):
+    zone = _extract(args, "get_timezone_time", "zone", "timezone")
+    data = _http_get(f"http://worldtimeapi.org/api/timezone/{zone}", label="timezone")
+    return {
+        "timezone": zone,
+        "datetime": data.get("datetime"),
+        "utc_offset": data.get("utc_offset"),
+    }
+
+
+def _call_predict_gender(args):
+    name = _extract(args, "predict_gender", "name", "first_name")
+    data = _http_get("https://api.genderize.io", params={"name": name}, label="gender")
+    return {
+        "name": name,
+        "gender": data.get("gender"),
+        "probability": data.get("probability"),
+    }
+
+
+def _call_predict_nationality(args):
+    name = _extract(args, "predict_nationality", "name", "person_name")
+    data = _http_get("https://api.nationalize.io", params={"name": name}, label="nationality")
+    countries = data.get("country", [])
+    country_map = {
+    "IN": "India",
+    "US": "United States",
+    "FR": "France",
+    "GB": "United Kingdom",
+    "BD": "Bangladesh",
+    "AE": "United Arab Emirates",
+    "PK": "Pakistan",
+    }
+
+    top_country = None
+
+    if countries and "country_id" in countries[0]:
+        code = countries[0]["country_id"]
+        top_country = country_map.get(code)
+
+    result = {"name": name}
+
+    if top_country:
+        result["country"] = top_country   # REQUIRED FOR CASCADE
+
+    return result
+
+
+def _call_reverse_geocode(args):
+    lat = _extract(args, "reverse_geocode", "lat", "latitude")
+    lon = _extract(args, "reverse_geocode", "lon", "longitude")
+
+    data = _http_get(
+        "https://api.bigdatacloud.net/data/reverse-geocode-client",
+        params={"latitude": lat, "longitude": lon},
+        label="reverse_geo"
+    )
+
+    return {
+        "city": data.get("city"),
+        "country": data.get("countryName"),
+    }
+
+
+def _call_get_bank_details(args):
+    ifsc = _extract(args, "get_bank_details", "ifsc", "ifsc_code")
+    data = _http_get(f"https://ifsc.razorpay.com/{ifsc}", label="bank")
+
+    return {
+        "bank": data.get("BANK"),
+        "branch": data.get("BRANCH"),
+        "city": data.get("CITY"),
+    }
+
+
+def _call_get_ip_details(args):
+    ip = _extract(args, "get_ip_details", "ip", "ip_address")
+    data = _http_get(f"https://ipapi.co/{ip}/json/", label="ip")
+
+    return {
+        "ip": ip,
+        "city": data.get("city"),
+        "country": data.get("country_name"),
+    }
+
+
+def _call_get_currency_info(args):
+    country = _extract(args, "get_currency_info", "country", "country_name")
+    data = _http_get(f"https://restcountries.com/v3.1/name/{country}", label="currency")
+
+    d = data[0]
+    currencies = d.get("currencies", {})
+    return {
+        "country": country,
+        "currencies": list(currencies.keys()),
+    }
+
 # ═══════════════════════════════════════════════════════════════
 # TOOL ROUTER
 # ═══════════════════════════════════════════════════════════════
@@ -283,6 +382,13 @@ _TOOL_MAP = {
     "get_dog_image": _call_get_dog_image,
     "get_activity": _call_get_activity,
     "predict_age": _call_predict_age,
+    "get_timezone_time": _call_get_timezone_time,
+    "predict_gender": _call_predict_gender,
+    "predict_nationality": _call_predict_nationality,
+    "reverse_geocode": _call_reverse_geocode,
+    "get_bank_details": _call_get_bank_details,
+    "get_ip_details": _call_get_ip_details,
+    "get_currency_info": _call_get_currency_info,
 }
 
 def call_tool(name, arguments):

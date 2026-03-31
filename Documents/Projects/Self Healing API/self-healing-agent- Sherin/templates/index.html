@@ -92,6 +92,7 @@
         .meta-card.success { background: #022c22; border-color: #10b981; color: #6ee7b7; }
         .meta-card.error { background: #450a0a; border-color: #ef4444; color: #fca5a5; }
         .meta-card.sbsa { background: #1e1b4b; border-color: #8b5cf6; color: #c4b5fd; }
+        .meta-card.cascade { background: #0f4f2f; border-color: #10b981; color: #6ee7b7; }
         .meta-card .meta-title { font-weight: 600; margin-bottom: 4px; }
         .meta-card .meta-row { padding: 1px 0; }
         .sim-bar-bg { display: inline-block; width: 80px; height: 8px; background: #334155; border-radius: 4px; vertical-align: middle; margin-left: 4px; }
@@ -461,6 +462,23 @@
             data.healing_steps.forEach(s => { meta += `<div class="meta-row">${esc(s)}</div>`; });
             data.warnings.forEach(w => { meta += `<div class="meta-row">⚠️ ${esc(w)}</div>`; });
             html += `<div class="meta-card ${cls}">${meta}</div>`;
+        }
+
+        // Cascade report + raw data
+        if (data.cascade_data || data.cascaded_tools?.length || data.raw_tool_data) {
+            let meta = `<div class="meta-title">🔄 Cascade Chain (${data.cascaded_tools?.length || 0} tools)</div>`;
+            if (data.cascaded_tools && data.cascaded_tools.length) {
+                data.cascaded_tools.forEach(tool => {
+                    meta += `<div class="meta-row">${esc(tool)}</div>`;
+                });
+            }
+            html += `<div class="meta-card cascade">${meta}</div>`;
+            
+            // Raw tool data - show if cascades or complex data
+            if (data.raw_tool_data && Object.keys(data.raw_tool_data).length > 2) {
+                const rawData = JSON.stringify(data.raw_tool_data, null, 2);
+                html += `<div class="meta-card success" style="font-family:monospace;font-size:11px;"><div class="meta-title">📊 Raw Tool Data</div><div class="meta-row">${esc(rawData)}</div></div>`;
+            }
         }
 
         // SBSA report

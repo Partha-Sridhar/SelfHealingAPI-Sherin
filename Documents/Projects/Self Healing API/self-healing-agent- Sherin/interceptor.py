@@ -42,9 +42,11 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from api_registry import API_REGISTRY as TOOL_REGISTRY
 import ollama
 import sbsa_engine
 import analytics_logger
+
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -148,7 +150,7 @@ for _name, _info in API_REGISTRY.items():
         "v2_schema":       {k: v.get("description", "") for k, v in _v2.items()},
         "expected_result": [],
         "result_ranges":   {},
-        "cascade":         None,
+        "cascade":         _info.get("cascade"),
         "docs_url":        _info.get("docs_url"),
         "base_url":        _info.get("base_url"),
     }
@@ -512,68 +514,134 @@ def check_stale_result(tool: str, result: Any) -> Any:
 # ═══════════════════════════════════════════════════════════════
 # STAGE 10 — CASCADING TOOL CALLS
 # ═══════════════════════════════════════════════════════════════
+def flatten_dict(d, parent_key='', sep='_'):
+    items = {}
+    for k, v in d.items():
+        new_key = k.replace("_cascade_", "")  # clean keys
+        if isinstance(v, dict):
+            items.update(flatten_dict(v, new_key, sep=sep))
+        else:
+            items[new_key] = v
+    return items
 
 def maybe_cascade(
     tool: str, arguments: Dict[str, Any], result: Any,
     server_mgr: ServerManager, original_req: dict, depth: int = 0,
 ) -> Any:
-    """
-    Automatically chain a second tool call when the first result contains
-    a value useful as input to another tool. Depth-limited to MAX_CASCADE_DEPTH.
 
-    Example: get_country_info(country="France")
-      -> result contains capital="Paris"
-      -> automatically calls get_weather(city="Paris")
-      -> result["_cascade_weather"] = {...}
-    """
+    # DEBUG START
+    log.info("DEBUG Cascade START | tool=%s | depth=%d | result=%s", tool, depth, result)
+
     if depth >= MAX_CASCADE_DEPTH:
+        log.warning("DEBUG Cascade STOP | max depth reached (%d)", depth)
         return result
 
-    info    = TOOL_REGISTRY.get(tool)
+    info = TOOL_REGISTRY.get(tool)
+
+    # 🔥 NEW DEBUG (MOST IMPORTANT)
+    log.info("DEBUG TOOL ENTRY FULL = %s", info)
+    log.info("DEBUG AVAILABLE TOOLS = %s", list(TOOL_REGISTRY.keys()))
+
     cascade = info.get("cascade") if info else None
-    if not cascade or not isinstance(result, dict):
+
+    if not cascade:
+        log.warning("DEBUG Cascade SKIPPED | tool=%s has no cascade config", tool)
         return result
 
-    trigger_value = result.get(cascade["trigger_field"])
+    if not isinstance(result, dict):
+        log.warning("DEBUG Cascade SKIPPED | result is not dict: %s", result)
+        return result
+
+    # CHECK trigger field
+    trigger_field = cascade["trigger_field"]
+    trigger_value = result.get(trigger_field)
+
     if not trigger_value:
+        log.warning(
+            "DEBUG Cascade SKIPPED | tool=%s | missing trigger_field='%s' in result=%s",
+            tool, trigger_field, result
+        )
         return result
 
     next_tool = cascade["next_tool"]
+
+    # Build next args
     next_args = {
         next_arg: result[src_field]
         for next_arg, src_field in cascade["arg_map"].items()
         if result.get(src_field)
     }
+
     if not next_args:
+        log.warning(
+            "DEBUG Cascade SKIPPED | tool=%s | empty next_args after mapping | result=%s",
+            tool, result
+        )
         return result
 
-    log.info("  Cascade | %s -> %s  args=%s  depth=%d", tool, next_tool, next_args, depth)
+    log.info(
+        "Cascade | %s -> %s | trigger=%s | args=%s | depth=%d",
+        tool, next_tool, trigger_value, next_args, depth
+    )
 
-    # Heal cascade args through the same SBSA pipeline
+    # SBSA HEALING
     version = _server_schema_version["version"]
     healed_args = SchemaHealer.heal(next_tool, next_args, force_version=version)
     healed_args = strip_extra_fields(next_tool, healed_args, version)
+
     if healed_args != next_args:
-        log.info("  Cascade | healed args: %s -> %s", next_args, healed_args)
+        log.info("DEBUG Cascade HEALED | %s -> %s", next_args, healed_args)
+
+    # DEBUG CALL
+    log.info(
+        "DEBUG Cascade CALL | %s -> %s | trigger=%s | healed_args=%s",
+        tool, next_tool, trigger_value, healed_args
+    )
 
     try:
         next_resp = server_mgr.send({
-            "jsonrpc": "2.0", "id": original_req.get("id"),
-            "method":  "tools/call",
-            "params":  {"name": next_tool, "arguments": healed_args},
+            "jsonrpc": "2.0",
+            "id": original_req.get("id"),
+            "method": "tools/call",
+            "params": {
+                "name": next_tool,
+                "arguments": healed_args
+            },
         })
+
+        # DEBUG RESPONSE
+        log.info("DEBUG Cascade RESPONSE | tool=%s | resp=%s", next_tool, next_resp)
+
         if "result" in next_resp:
-            next_data   = next_resp["result"].get("structuredContent", next_resp["result"])
-            next_data   = maybe_cascade(next_tool, next_args, next_data,
-                                        server_mgr, original_req, depth + 1)
+            next_data = next_resp["result"].get("structuredContent", next_resp["result"])
+
+            # RECURSIVE CASCADE
+            next_data = maybe_cascade(
+                next_tool,
+                healed_args,
+                next_data,
+                server_mgr,
+                original_req,
+                depth + 1
+            )
+
             cascade_key = f"_cascade_{next_tool.replace('get_', '')}"
-            result      = dict(result)
-            result[cascade_key] = next_data
-            log.info("  Cascade | attached %s", cascade_key)
+            result = dict(result)
+            # 🔥 FLATTEN instead of nesting
+            for k, v in next_data.items():
+                if k not in result:
+                    result[k] = v
+
+            log.info("DEBUG Cascade ATTACHED | key=%s", cascade_key)
+
         else:
-            log.warning("  Cascade | %s returned error: %s", next_tool, next_resp.get("error"))
+            log.warning(
+                "DEBUG Cascade ERROR | tool=%s returned error=%s",
+                next_tool, next_resp.get("error")
+            )
+
     except Exception as exc:
-        log.warning("  Cascade | %s failed: %s", next_tool, exc)
+        log.error("DEBUG Cascade EXCEPTION | tool=%s | error=%s", next_tool, exc)
 
     return result
 
@@ -774,6 +842,9 @@ class ProxySession:
             data = check_stale_result(tool_name, data)
             data = maybe_cascade(tool_name, healed, data, self.server_mgr, req)
             data = reassess_result(tool_name, healed, data)
+            data = flatten_dict(data)
+            log.info("FINAL FLATTENED DATA = %s", data)
+
             resp["result"]["structuredContent"] = data
 
         self._send_client(resp)
