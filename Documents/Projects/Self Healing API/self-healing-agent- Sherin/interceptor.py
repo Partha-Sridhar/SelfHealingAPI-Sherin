@@ -15,7 +15,7 @@ Pipeline for every tools/call
                            than being dropped, leaving the healer with nothing to work from.
   3. EXTRA FIELD STRIP   — unknown keys removed AFTER healing.
   4. FORWARD             — repaired request sent to mcp_server.py.
-  5. DRIFT RECOVERY      — V1->V2 field-name drift detected; args re-healed and retried.
+  5. DRIFT RECOVERY      — field-name drift detected; args re-healed and retried.
   6. RATE-LIMIT (429)    — Retry-After header respected; deterministic sleep + retry.
   7. API TIMEOUT/5xx     — upstream HTTP timeouts AND 5xx errors retried with back-off;
                            LLM decides retry | fallback stub | fail. Per-attempt timing
@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import logging
+import json
 from typing import Any, Dict, Optional, Tuple
 
 from api_registry import API_REGISTRY as TOOL_REGISTRY
@@ -131,14 +132,14 @@ import schema_discovery
 
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 for _name, _info in API_REGISTRY.items():
-    _v1 = _info["v1_schema"]
+    _schema = _info["schema"]
     TOOL_REGISTRY[_name] = {
         "description":     _info["description"],
         "category":        _info["domain"],
-        "required":        [k for k, v in _v1.items() if v.get("required")],
+        "required":        [k for k, v in _schema.items() if v.get("required")],
         "defaults":        {},
-        "fields":          list(_v1.keys()),
-        "schema":          {k: v.get("description", "") for k, v in _v1.items()},
+        "fields":          list(_schema.keys()),
+        "schema":          {k: v.get("description", "") for k, v in _schema.items()},
         "expected_result": [],
         "result_ranges":   {},
         "cascade":         _info.get("cascade"),
@@ -148,8 +149,8 @@ for _name, _info in API_REGISTRY.items():
 
 log.info("Interceptor registry: %d tools from api_registry", len(TOOL_REGISTRY))
 
-# Tracks which schema version the server is currently using.
-_server_schema_version: Dict[str, str] = {"version": "v1"}
+# Schema tracking
+_server_schema_version: Dict[str, str] = {"version": "current"}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -174,54 +175,196 @@ def _llm(prompt: str, label: str) -> Optional[dict]:
         return None
 
 
-def _route_query_to_tool(query: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Use the LLM agent to choose the best tool and extract arguments from a user query."""
-    tools = []
-    for name, info in TOOL_REGISTRY.items():
-        api_schema = API_REGISTRY.get(name, {}).get("v1_schema", {})
-        params = []
-        required = []
-        for key, details in api_schema.items():
-            params.append(f"{key}: {details.get('description', '').strip()}")
-            if details.get("required"):
-                required.append(key)
-        params_text = "; ".join(params) if params else "none"
-        required_text = ", ".join(required) if required else "none"
-        tools.append(
-            f"{name}: {info.get('description', '')}\n  params: {params_text}\n  required: {required_text}"
-        )
+# ═══════════════════════════════════════════════════════════════
+# QUERY ANALYSIS AGENT
+# ═══════════════════════════════════════════════════════════════
 
-    prompt = f"""
-You are an OpenAI-style routing agent. A user provides a natural language query, and you must select the single best MCP tool to handle it.
+class QueryAnalysisAgent:
+    """
+    Agent for analyzing natural language queries and mapping them to appropriate tools/APIs.
+    Handles query understanding, tool selection, and argument extraction.
+    """
 
-Available tools:
-{chr(10).join(tools)}
+    def __init__(self):
+        self.analysis_history = []
+        self.last_selected_tool = None
+        self.last_extracted_args = {}
 
-User query: {query}
+    def analyze_and_map(self, query: str) -> Tuple[Optional[str], Dict[str, Any], Dict[str, Any]]:
+        """
+        Analyze a user query and map it to the most appropriate tool.
+        Returns: (tool_name, extracted_arguments, analysis_details)
+        """
+        log.info("►► QueryAnalysisAgent | analyzing: %s", query)
 
-Return exactly one JSON object with these keys:
-- tool: the selected tool name, or null if none matches
-- arguments: an object containing extracted arguments for that tool
+        analysis = {
+            "query": query,
+            "timestamp": time.time(),
+            "status": "pending",
+        }
 
-Example output:
+        # Step 1: Build tool catalog with descriptions
+        tool_catalog = self._build_tool_catalog()
+        analysis["tools_available"] = len(tool_catalog)
+
+        # Step 2: Query analysis via LLM
+        tool_name, confidence, reasoning = self._select_tool_with_reasoning(query, tool_catalog)
+        analysis["selected_tool"] = tool_name
+        analysis["confidence"] = confidence
+        analysis["reasoning"] = reasoning
+
+        if not tool_name:
+            analysis["status"] = "no_match"
+            log.warning("QueryAnalysisAgent | no matching tool found")
+            self.analysis_history.append(analysis)
+            return None, {}, analysis
+
+        # Step 3: Extract arguments from query
+        args = self._extract_arguments(query, tool_name)
+        analysis["extracted_arguments"] = args
+
+        # Step 4: Validate against tool schema
+        validation = self._validate_arguments(tool_name, args)
+        analysis["validation"] = validation
+
+        if not validation.get("is_valid", False):
+            log.warning("QueryAnalysisAgent | validation failed: %s", validation.get("issues"))
+
+        analysis["status"] = "success"
+        self.last_selected_tool = tool_name
+        self.last_extracted_args = args
+
+        log.info("QueryAnalysisAgent ✓ | tool=%s  args=%s  confidence=%.2f",
+                 tool_name, args, confidence)
+
+        self.analysis_history.append(analysis)
+        return tool_name, args, analysis
+
+    def _build_tool_catalog(self) -> str:
+        """Build formatted catalog of available tools for LLM prompt."""
+        tools_desc = []
+        for name, info in TOOL_REGISTRY.items():
+            desc = info.get("description", "")
+            category = info.get("category", "")
+            required = info.get("required", [])
+            fields = info.get("fields", [])
+
+            tool_desc = f"• {name} ({category})\n"
+            tool_desc += f"  Description: {desc}\n"
+            tool_desc += f"  Fields: {', '.join(fields) if fields else 'none'}\n"
+            tool_desc += f"  Required: {', '.join(required) if required else 'none'}"
+
+            tools_desc.append(tool_desc)
+
+        return "\n".join(tools_desc)
+
+    def _select_tool_with_reasoning(
+        self, query: str, tool_catalog: str
+    ) -> Tuple[Optional[str], float, str]:
+        """Use LLM to select best tool with reasoning and confidence score."""
+        prompt = f"""You are an intelligent API router agent. Given a user query, select the most appropriate tool.
+
+Available Tools:
+{tool_catalog}
+
+User Query: "{query}"
+
+Respond with a JSON object containing:
+- "tool": the name of the best matching tool (or null if no match)
+- "confidence": a float between 0 and 1 indicating how confident you are (1.0 = perfect match)
+- "reasoning": a brief explanation of why you selected this tool
+
+Example:
 {{
   "tool": "get_weather",
-  "arguments": {{"city": "London"}}
+  "confidence": 0.95,
+  "reasoning": "The query asks about weather in a specific city"
 }}
-
-Do not include any additional text.
 """
+        decision = _llm(prompt, "tool_selection")
+        if not decision:
+            return None, 0.0, "LLM failed to respond"
 
-    decision = _llm(prompt, "query_router")
-    if not decision:
-        return None, {}
+        tool = decision.get("tool")
+        confidence = float(decision.get("confidence", 0.0))
+        reasoning = decision.get("reasoning", "")
 
-    tool = decision.get("tool")
-    args = decision.get("arguments", {})
-    if not isinstance(args, dict):
-        args = {}
+        return tool, confidence, reasoning
 
-    return tool, args
+    def _extract_arguments(self, query: str, tool_name: str) -> Dict[str, Any]:
+        """Extract tool arguments from the query."""
+        tool_info = TOOL_REGISTRY.get(tool_name, {})
+        fields = tool_info.get("fields", [])
+        field_descs = tool_info.get("schema", {})
+
+        prompt = f"""Extract arguments from this query for the '{tool_name}' tool.
+
+Available fields:
+{chr(10).join(f"- {f}: {field_descs.get(f, '')}" for f in fields)}
+
+Query: "{query}"
+
+Return a JSON object with extracted values. Only include fields that you can confidently extract.
+If a field cannot be extracted, omit it. Return {{}}} if no arguments can be extracted.
+"""
+        result = _llm(prompt, f"extract_args_{tool_name}")
+        if not result:
+            return {}
+
+        # Ensure result is a dict
+        return result if isinstance(result, dict) else {}
+
+    def _validate_arguments(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate extracted arguments against tool schema."""
+        tool_info = TOOL_REGISTRY.get(tool_name, {})
+        required_fields = tool_info.get("required", [])
+        available_fields = tool_info.get("fields", [])
+
+        validation = {
+            "is_valid": True,
+            "issues": [],
+            "missing_required": [],
+            "invalid_fields": [],
+        }
+
+        # Check required fields
+        missing = [f for f in required_fields if f not in args or not str(args.get(f, "")).strip()]
+        if missing:
+            validation["is_valid"] = False
+            validation["missing_required"] = missing
+
+        # Check for invalid fields
+        invalid = [f for f in args.keys() if f not in available_fields]
+        if invalid:
+            validation["invalid_fields"] = invalid
+
+        if validation["missing_required"]:
+            validation["issues"].append(f"Missing required: {', '.join(validation['missing_required'])}")
+        if validation["invalid_fields"]:
+            validation["issues"].append(f"Unknown fields: {', '.join(validation['invalid_fields'])}")
+
+        return validation
+
+    def get_last_analysis(self) -> Dict[str, Any]:
+        """Get the most recent analysis result."""
+        return self.analysis_history[-1] if self.analysis_history else {}
+
+    def get_analysis_history(self, limit: int = 10) -> list:
+        """Get analysis history (most recent first)."""
+        return self.analysis_history[-limit:][::-1]
+
+
+# Global agent instance
+_query_agent = QueryAnalysisAgent()
+
+
+def _route_query_to_tool(query: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Delegate to QueryAnalysisAgent for intelligent query routing.
+    Returns tool name and extracted arguments.
+    """
+    tool, args, _ = _query_agent.analyze_and_map(query)
+    return tool, args if args else {}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -319,12 +462,8 @@ class SchemaHealer:
         # Run deterministic SBSA alignment
         agent_keys = list(raw_args.keys())
 
-        # Get descriptions from both schema versions for semantic enrichment
-        api_v1 = api_tool.get("v1_schema", {})
-        api_v2 = api_tool.get("v2_schema", {})
-        agent_desc = api_v1 if version == "v2" else api_v2
-        if not agent_desc:
-            agent_desc = api_v1 or api_v2
+        # Get schema descriptions for semantic enrichment
+        agent_desc = api_tool.get("schema", {})
         api_desc = schema  # current version's schema has the descriptions
 
         cls.last_report = sbsa_engine.get_alignment_report(
@@ -800,11 +939,11 @@ class ProxySession:
                 self._query_pipeline(req)
                 return
 
-            # Intercept set_drift to reset our schema version tracker
+            # Intercept set_drift to track drift state
             if method == "set_drift":
                 drift_active = req.get("params", {}).get("active", False)
-                _server_schema_version["version"] = "v1"
-                log.info("DRIFT TOGGLED → %s  (interceptor schema reset to v1)",
+                _server_schema_version["version"] = "current"
+                log.info("DRIFT TOGGLED → %s",
                          "ON 🔴" if drift_active else "OFF 🟢")
 
             log.info("pass-through  method=%s  id=%s", method, req.get("id"))
@@ -865,14 +1004,12 @@ class ProxySession:
 
         # Stage 5: Drift recovery
         if resp.get("error", {}).get("error_type") == "drift":
-            old_v = _server_schema_version["version"]
-            _server_schema_version["version"] = "v2"
-            log.warning("  DRIFT DETECTED — schema %s -> v2; re-healing ...", old_v)
-            healed_v2 = SchemaHealer.heal(tool_name, raw_args, force_version="v2")
-            healed_v2 = strip_extra_fields(tool_name, healed_v2, "v2")
-            req["params"]["arguments"] = healed_v2
-            log.info("  re-healed (v2) = %s", healed_v2)
-            resp = self._forward_with_retry(req, tool_name, healed_v2)
+            log.warning("  DRIFT DETECTED — schema mismatch; re-healing ...")
+            healed_alt = SchemaHealer.heal(tool_name, raw_args, force_version="alternate")
+            healed_alt = strip_extra_fields(tool_name, healed_alt, "alternate")
+            req["params"]["arguments"] = healed_alt
+            log.info("  re-healed = %s", healed_alt)
+            resp = self._forward_with_retry(req, tool_name, healed_alt)
 
             if "result" in resp:
                 sc = resp["result"].get("structuredContent", {})
