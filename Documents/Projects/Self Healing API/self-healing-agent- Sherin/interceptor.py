@@ -7,8 +7,9 @@ Architecture:
 
 Pipeline for every tools/call
 ──────────────────────────────
+  0. QUERY ROUTING       — LLM agent selects appropriate tool for natural language queries.
   1. TYPE COERCION       — wrong-type args (int/list instead of string) silently cast.
-  2. SCHEMA HEALING      — LLM maps client args to exact server schema (field renames +
+  2. SCHEMA HEALING      — SBSA maps client args to exact server schema (field renames +
                            value normalisation). Runs BEFORE extra-field strip so that
                            misnamed keys like "location" are mapped to "city" rather
                            than being dropped, leaving the healer with nothing to work from.
@@ -24,15 +25,7 @@ Pipeline for every tools/call
   9. STALE RESULT        — out-of-range numeric values flagged with a warning.
  10. CASCADING TOOLS     — result feeds a second tool call automatically when useful.
  11. RESULT REASSESSMENT — final LLM sanity check; suspicious data annotated.
-
-Notifications (no "id") are forwarded fire-and-forget — they never block.
-Pass-through requests (initialize, tools/list) are forwarded transparently.
-
-Run:  python interceptor.py
 """
-
-import json
-import logging
 import os
 import re
 import socket
@@ -40,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 from api_registry import API_REGISTRY as TOOL_REGISTRY
@@ -138,16 +132,13 @@ import schema_discovery
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 for _name, _info in API_REGISTRY.items():
     _v1 = _info["v1_schema"]
-    _v2 = _info["v2_schema"]
     TOOL_REGISTRY[_name] = {
         "description":     _info["description"],
         "category":        _info["domain"],
         "required":        [k for k, v in _v1.items() if v.get("required")],
         "defaults":        {},
-        "v1_fields":       list(_v1.keys()),
-        "v2_fields":       list(_v2.keys()),
-        "v1_schema":       {k: v.get("description", "") for k, v in _v1.items()},
-        "v2_schema":       {k: v.get("description", "") for k, v in _v2.items()},
+        "fields":          list(_v1.keys()),
+        "schema":          {k: v.get("description", "") for k, v in _v1.items()},
         "expected_result": [],
         "result_ranges":   {},
         "cascade":         _info.get("cascade"),
@@ -181,6 +172,56 @@ def _llm(prompt: str, label: str) -> Optional[dict]:
     except Exception as exc:
         log.warning("  LLM[%s] call failed: %s", label, exc)
         return None
+
+
+def _route_query_to_tool(query: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Use the LLM agent to choose the best tool and extract arguments from a user query."""
+    tools = []
+    for name, info in TOOL_REGISTRY.items():
+        api_schema = API_REGISTRY.get(name, {}).get("v1_schema", {})
+        params = []
+        required = []
+        for key, details in api_schema.items():
+            params.append(f"{key}: {details.get('description', '').strip()}")
+            if details.get("required"):
+                required.append(key)
+        params_text = "; ".join(params) if params else "none"
+        required_text = ", ".join(required) if required else "none"
+        tools.append(
+            f"{name}: {info.get('description', '')}\n  params: {params_text}\n  required: {required_text}"
+        )
+
+    prompt = f"""
+You are an OpenAI-style routing agent. A user provides a natural language query, and you must select the single best MCP tool to handle it.
+
+Available tools:
+{chr(10).join(tools)}
+
+User query: {query}
+
+Return exactly one JSON object with these keys:
+- tool: the selected tool name, or null if none matches
+- arguments: an object containing extracted arguments for that tool
+
+Example output:
+{{
+  "tool": "get_weather",
+  "arguments": {{"city": "London"}}
+}}
+
+Do not include any additional text.
+"""
+
+    decision = _llm(prompt, "query_router")
+    if not decision:
+        return None, {}
+
+    tool = decision.get("tool")
+    args = decision.get("arguments", {})
+    if not isinstance(args, dict):
+        args = {}
+
+    return tool, args
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -224,7 +265,7 @@ def _args_satisfy_schema(tool: str, args: Dict[str, Any], version: str) -> bool:
     info = TOOL_REGISTRY.get(tool)
     if not info or not info["required"]:
         return True
-    server_fields = info.get(f"{version}_fields") or list(info.get(f"{version}_schema", {}).keys())
+    server_fields = list(API_REGISTRY.get(tool, {}).get(f"{version}_schema", {}).keys())
     return bool(server_fields) and all(str(args.get(f, "")).strip() for f in server_fields)
 
 
@@ -253,8 +294,9 @@ class SchemaHealer:
             return {}
 
         version       = force_version or _server_schema_version["version"]
-        schema        = info.get(f"{version}_schema") or info.get("v1_schema", {})
-        server_fields = info.get(f"{version}_fields") or list(schema.keys())
+        api_tool      = API_REGISTRY.get(tool, {})
+        schema        = api_tool.get(f"{version}_schema", {})
+        server_fields = list(schema.keys())
 
         # Short-circuit: args already match the current server schema
         if server_fields and all(str(raw_args.get(f, "")).strip() for f in server_fields):
@@ -278,11 +320,11 @@ class SchemaHealer:
         agent_keys = list(raw_args.keys())
 
         # Get descriptions from both schema versions for semantic enrichment
-        # Agent sent v1-style keys, API expects v2-style keys (or vice versa)
-        v1_schema = info.get("v1_schema", {})
-        v2_schema = info.get("v2_schema", {})
-        # Agent descriptions: try the opposite version (agent is likely using the old one)
-        agent_desc = v1_schema if version == "v2" else v2_schema
+        api_v1 = api_tool.get("v1_schema", {})
+        api_v2 = api_tool.get("v2_schema", {})
+        agent_desc = api_v1 if version == "v2" else api_v2
+        if not agent_desc:
+            agent_desc = api_v1 or api_v2
         api_desc = schema  # current version's schema has the descriptions
 
         cls.last_report = sbsa_engine.get_alignment_report(
@@ -312,10 +354,9 @@ def strip_extra_fields(tool: str, args: Dict[str, Any], version: str) -> Dict[st
     Must run after SchemaHealer so that misnamed fields are first mapped
     to their correct names before any unknown keys are dropped.
     """
-    info = TOOL_REGISTRY.get(tool)
-    if info is None:
+    if tool not in API_REGISTRY:
         return args
-    schema_keys = set(info.get(f"{version}_schema", {}).keys())
+    schema_keys = set(API_REGISTRY.get(tool, {}).get(f"{version}_schema", {}).keys())
     if not schema_keys:
         return args
     stripped = {k: v for k, v in args.items() if k in schema_keys}
@@ -755,6 +796,10 @@ class ProxySession:
                 self._tool_call_pipeline(req)
                 return
 
+            if method == "query":
+                self._query_pipeline(req)
+                return
+
             # Intercept set_drift to reset our schema version tracker
             if method == "set_drift":
                 drift_active = req.get("params", {}).get("active", False)
@@ -881,6 +926,88 @@ class ProxySession:
             tool_name, outcome, time.monotonic() - pipeline_start,
         )
         log.info("=" * 60)
+
+    def _query_pipeline(self, req: dict):
+        """
+        Handle natural language queries by using an LLM agent to select the appropriate tool
+        and extract arguments, then delegate to the tool call pipeline.
+        """
+        params = req.get("params", {})
+        query = params.get("query", "")
+        if not query:
+            self._send_client({
+                "jsonrpc": "2.0", "id": req.get("id"),
+                "error": {"code": -32602, "message": "Missing 'query' parameter", "error_type": "schema"},
+            })
+            return
+
+        log.info("QUERY PIPELINE START  query=%s", query)
+
+        # Build prompt with available tools
+        tools_info = []
+        for name, info in TOOL_REGISTRY.items():
+            desc = info.get("description", "")
+            category = info.get("category", "")
+            tools_info.append(f"- {name} ({category}): {desc}")
+
+        tools_list = "\n".join(tools_info)
+        prompt = f"""
+You are an intelligent agent that routes user queries to the appropriate MCP tool.
+
+Available tools:
+{tools_list}
+
+User query: {query}
+
+Analyze the query and select the most appropriate tool. Extract any relevant arguments from the query.
+
+Respond with a JSON object in this exact format:
+{{
+  "tool": "tool_name",
+  "arguments": {{
+    "arg1": "value1",
+    "arg2": "value2"
+  }}
+}}
+
+If no tool matches, respond with {{"tool": null, "arguments": {{}}}}
+"""
+
+        # Call LLM to decide tool and arguments
+        decision = _llm(prompt, "tool_selection")
+        if not decision:
+            self._send_client({
+                "jsonrpc": "2.0", "id": req.get("id"),
+                "error": {"code": -32001, "message": "Failed to select tool via LLM", "error_type": "unknown"},
+            })
+            return
+
+        selected_tool = decision.get("tool")
+        selected_args = decision.get("arguments", {})
+        if not isinstance(selected_args, dict):
+            selected_args = {}
+
+        if not selected_tool or selected_tool not in TOOL_REGISTRY:
+            self._send_client({
+                "jsonrpc": "2.0", "id": req.get("id"),
+                "error": {"code": -32001, "message": f"No suitable tool found for query: {query}", "error_type": "schema"},
+            })
+            return
+
+        log.info("QUERY PIPELINE | selected tool=%s  args=%s", selected_tool, selected_args)
+
+        # Convert to tool call and delegate to existing pipeline
+        tool_req = {
+            "jsonrpc": "2.0",
+            "id": req.get("id"),
+            "method": "tools/call",
+            "params": {
+                "name": selected_tool,
+                "arguments": selected_args
+            }
+        }
+
+        self._tool_call_pipeline(tool_req)
 
     def _forward_with_retry(self, req: dict, tool_name: str, arguments: Dict[str, Any]) -> dict:
         """
