@@ -1,10 +1,36 @@
 """
-MCP Tool Server — 18 Real APIs + Schema Drift Simulator
-========================================================
+MCP Tool Server — 18 Real APIs + Schema Drift Simulator (SBSA-aligned)
+======================================================================
 Communicates over stdin/stdout (JSON-RPC 2.0).
 
 Serves 18 real-world APIs across 17 domains from api_registry.py.
-Supports live V1↔V2 schema drift toggling for benchmarking.
+Supports live baseline↔drift schema toggling for benchmarking.
+
+This server exposes two shapes for the same logical tools — **baseline** and **drift** —
+matching the interceptor's TOOL_REGISTRY (`schema` vs `drift_schema` / `drift_aliases`).
+
+BASELINE SCHEMA
+───────────────
+Field names stable clients / LLMs typically emit.
+
+DRIFT SCHEMA
+────────────
+After a simulated "upgrade", the server only accepts renamed parameters.
+
+Toggle drift live:
+  {"jsonrpc":"2.0","id":99,"method":"set_drift","params":{"active":true}}
+
+Or at startup:
+  SCHEMA_DRIFT=1 python mcp_server.py
+
+WITHOUT interceptor: drift mode + baseline argument names → immediate drift error.
+WITH    interceptor (SBSA): arguments are healed to the live shape and retried.
+
+Error taxonomy (error_type on every error response)
+───────────────────────────────────────────────────
+  schema  — required arg missing or wrong field name
+  drift   — drift active; caller used baseline field names instead of drift names
+  timeout / network / api / parse / unknown — as documented inline
 """
 
 import hashlib
@@ -19,6 +45,8 @@ from requests.exceptions import ConnectionError as ReqConnectionError, ReadTimeo
 
 from api_registry import API_REGISTRY
 
+import dynamic_discovery
+
 HTTP_TIMEOUT_S = 8
 
 logging.basicConfig(level=logging.INFO, format="[server] %(levelname)s  %(message)s", stream=sys.stderr)
@@ -32,7 +60,7 @@ _state = {"drift": bool(os.environ.get("SCHEMA_DRIFT", ""))}
 def drift_active(): return _state["drift"]
 
 # ═══════════════════════════════════════════════════════════════
-# BUILD SCHEMAS FROM REGISTRY
+# BUILD SCHEMAS FROM REGISTRY — baseline (stable) vs drift (renamed parameters)
 # ═══════════════════════════════════════════════════════════════
 
 def _build_schemas(version):
@@ -51,11 +79,14 @@ def _build_schemas(version):
         }
     return schemas
 
-_SCHEMAS_V1 = _build_schemas("v1")
-_SCHEMAS_V2 = _build_schemas("v2")
+_SCHEMAS_BASELINE = _build_schemas("v1")
+_SCHEMAS_DRIFT = _build_schemas("v2")
 
 def active_schemas():
-    return _SCHEMAS_V2 if drift_active() else _SCHEMAS_V1
+    return _SCHEMAS_DRIFT if drift_active() else _SCHEMAS_BASELINE
+
+def _schema_mode_label() -> str:
+    return "drift" if drift_active() else "baseline"
 
 log.info("Loaded %d tools from api_registry", len(API_REGISTRY))
 
@@ -85,33 +116,47 @@ def _http_get(url, params=None, headers=None, label=""):
         raise ToolError(str(e), error_type="unknown") from e
 
 # ═══════════════════════════════════════════════════════════════
-# ARGUMENT EXTRACTION — drift-aware
+# ARGUMENT EXTRACTION — baseline vs drift field names
 # ═══════════════════════════════════════════════════════════════
 
-def _extract(arguments, tool, v1_field, v2_field):
+def _extract(arguments, tool, baseline_field, drift_field):
+    """
+    When drift is off, accept only baseline_field.
+    When drift is on, accept only drift_field; if the client still sends baseline_field,
+    raise error_type=drift (SBSA / interceptor heals and retries with drift_field).
+    """
     if drift_active():
-        val = arguments.get(v2_field, "")
+        val = arguments.get(drift_field, "")
         if isinstance(val, str): val = val.strip()
         if not val:
+            baseline_val = arguments.get(baseline_field, "")
+            if isinstance(baseline_val, str): baseline_val = baseline_val.strip()
+            if baseline_val:
+                raise ToolError(
+                    f"[{tool}] Schema drift detected: field '{baseline_field}' is no longer accepted. "
+                    f"The server now expects '{drift_field}' instead. "
+                    f"You sent: {arguments}",
+                    error_type="drift",
+                )
             schema = active_schemas().get(tool, {}).get("inputSchema", {})
             required = schema.get("required", [])
             raise ToolError(
-                f"[{tool}] Bad Request: missing required field(s): {required}. "
-                f"Received: {list(arguments.keys())}",
-                error_type="drift",
+                f"[{tool}] Missing required field '{drift_field}'. "
+                f"Got: {arguments}",
+                error_type="schema",
             )
         return val
     else:
-        val = arguments.get(v1_field, "")
+        val = arguments.get(baseline_field, "")
         if isinstance(val, str): val = val.strip()
         if not val:
-            raise ToolError(f"[{tool}] Missing required field '{v1_field}'. Got: {arguments}", error_type="schema")
+            raise ToolError(f"[{tool}] Missing required field '{baseline_field}'. Got: {arguments}", error_type="schema")
         return val
 
-def _extract_optional(arguments, v1_field, v2_field, default=None):
+def _extract_optional(arguments, baseline_field, drift_field, default=None):
     if drift_active():
-        return arguments.get(v2_field, default)
-    return arguments.get(v1_field, default)
+        return arguments.get(drift_field, default)
+    return arguments.get(baseline_field, default)
 
 # ═══════════════════════════════════════════════════════════════
 # TOOL IMPLEMENTATIONS — all 18 real APIs
@@ -407,7 +452,7 @@ def _err(id_, msg, error_type="unknown", code=-32000):
     _send({"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": str(msg), "error_type": error_type}})
 
 def main():
-    log.info("mcp_server ready  drift=%s  tools=%d", drift_active(), len(_TOOL_MAP))
+    log.info("mcp_server ready  schema_mode=%s  tools=%d", _schema_mode_label(), len(_TOOL_MAP))
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -421,20 +466,25 @@ def main():
             if method == "initialize":
                 _ok(id_, {"protocolVersion": "2024-11-05",
                           "serverInfo": {"name": "sbsa-tool-server", "version": "3.0",
-                                         "schema_version": "V2" if drift_active() else "V1",
+                                         "schema_mode": _schema_mode_label(),
                                          "tools_count": len(_TOOL_MAP)},
                           "capabilities": {"tools": {}}})
 
             elif method == "tools/list":
                 schemas = active_schemas()
-                _ok(id_, {"tools": [{"name": n, **s} for n, s in schemas.items()]})
+                static_tools = [{"name": n, **s} for n, s in schemas.items()]
+                dynamic_tools = dynamic_discovery.get_dynamic_tools_for_mcp()
+                _ok(id_, {"tools": static_tools + dynamic_tools})
 
             elif method == "tools/call":
                 params = req.get("params", {})
                 name = params.get("name")
                 arguments = params.get("arguments", {})
-                log.info("tools/call  tool=%s  schema=%s  args=%s", name, "V2" if drift_active() else "V1", arguments)
-                result = call_tool(name, arguments)
+                log.info("tools/call  tool=%s  schema_mode=%s  args=%s", name, _schema_mode_label(), arguments)
+                if name and name.startswith("dynamic_"):
+                    result = dynamic_discovery.call_dynamic_tool(name, arguments)
+                else:
+                    result = call_tool(name, arguments)
                 _ok(id_, {"structuredContent": result, "isError": False})
 
             elif method in ("initialized", "notifications/initialized"):
@@ -444,10 +494,23 @@ def main():
                 active = req.get("params", {}).get("active", False)
                 _state["drift"] = bool(active)
                 log.info("DRIFT → %s", "ON 🔴" if _state["drift"] else "OFF 🟢")
-                _ok(id_, {"drift_active": _state["drift"]})
+                _ok(id_, {"drift_active": _state["drift"], "schema_mode": _schema_mode_label()})
+
+            elif method == "register_dynamic_tool":
+                p = req.get("params", {})
+                tname = p.get("name", "")
+                dynamic_discovery._dynamic_tools[tname] = {
+                    "description": p.get("description", ""),
+                    "base_url": p.get("base_url", ""),
+                    "method": p.get("method", "GET"),
+                    "inputSchema": p.get("inputSchema", {}),
+                    "params": p.get("params", {}),
+                }
+                log.info("Registered dynamic tool in server: %s → %s", tname, p.get("base_url"))
+                _ok(id_, {"registered": tname})
 
             elif method == "get_drift_status":
-                _ok(id_, {"drift_active": _state["drift"]})
+                _ok(id_, {"drift_active": _state["drift"], "schema_mode": _schema_mode_label()})
 
             else:
                 _err(id_, f"Unknown method: '{method}'", code=-32601)

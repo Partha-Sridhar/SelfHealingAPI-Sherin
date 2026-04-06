@@ -14,11 +14,11 @@ HOW TO RUN
 
 WHAT YOU WILL SEE
 ─────────────────
-  🛡 WITH interceptor
-    • LLM heals misnamed/missing args before they reach the server
+  🛡 WITH interceptor (SBSA)
+    • Schema-Based Self-Healing maps args to the server's baseline or drift field names
     • Timeouts are retried with exponential back-off
     • Results are reassessed; suspicious data is annotated with a warning
-    • All healing steps are logged visibly
+    • Drift errors trigger a second heal pass against drift_schema; healing is visible in logs
 
   ⚡ WITHOUT interceptor
     • Args go straight from LLM → server, exactly as produced
@@ -314,6 +314,11 @@ def _print_error_detail(error: dict, using_interceptor: bool):
             "The API returned an unexpected response shape.",
             "This may be a temporary API change or outage.",
         ),
+        "drift": (
+            "The server is in drift mode: it expects renamed parameters (e.g. location_name instead of city).",
+            "Without the interceptor, callers must send the new field names. "
+            "With the interceptor, SBSA should rewrite arguments and retry automatically.",
+        ),
         "unknown": (
             "An unexpected internal error occurred.",
             "Check the server logs for more detail.",
@@ -340,8 +345,12 @@ def _print_result(data, using_interceptor: bool):
         _print_step("Result", using_interceptor, str(data))
         return
 
-    warn  = data.get("_interceptor_warning")
-    clean = {k: v for k, v in data.items() if not k.startswith("_")}
+    warn      = data.get("_interceptor_warning")
+    drift_fix = data.get("_sbsa_drift_note") or data.get("_drift_healed")
+    clean     = {k: v for k, v in data.items() if not k.startswith("_")}
+
+    if drift_fix and using_interceptor:
+        _print_step("🔧  SBSA drift recovery", using_interceptor, drift_fix)
 
     if warn:
         _print_step("⚠️  Interceptor warning", using_interceptor,
@@ -463,8 +472,8 @@ def _print_banner(tools: list, using_interceptor: bool):
     print("\n" + "═" * w)
     print("  MCP Self-Healing Agent")
     if using_interceptor:
-        print("  🛡  INTERCEPTOR MODE")
-        print("      Schema healing • Timeout retry • Result reassessment")
+        print("  🛡  INTERCEPTOR MODE  (SBSA)")
+        print("      Baseline/drift schema healing • Timeout retry • Result reassessment")
     else:
         print("  ⚡  DIRECT MODE  (raw — no healing, no retry)")
         print("      💡 Run  python interceptor.py  to enable self-healing")

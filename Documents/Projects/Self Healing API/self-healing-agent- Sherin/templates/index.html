@@ -105,6 +105,7 @@
         .badge.model { background: #312e81; color: #a5b4fc; }
         .badge.mode-on { background: #022c22; color: #6ee7b7; }
         .badge.mode-off { background: #450a0a; color: #fca5a5; }
+        .badge.discovery { background: #1e3a5f; color: #7dd3fc; }
 
         /* Input */
         .input-area { padding: 12px 20px; border-top: 1px solid #334155; display: flex; gap: 8px; }
@@ -452,7 +453,29 @@
         let badges = `<span class="badge model">${esc(model)}</span> `;
         badges += mode ? '<span class="badge mode-on">🛡️ SBSA</span>' : '<span class="badge mode-off">⚡ Direct</span>';
 
-        let html = `<div class="msg-bubble">${esc(data.answer)}<div style="margin-top:6px">${badges}</div></div>`;
+        // Format answer with basic markdown support
+        // Source badge: which API or LLM knowledge
+        let source = '';
+        if (data.dynamic_api) {
+            source = `<span class="badge discovery">🔍 ${esc(data.dynamic_api.name || 'Discovered API')}</span> `;
+        } else if (data.tool_used) {
+            source = `<span class="badge mode-on">🔧 ${esc(data.tool_used)}</span> `;
+        } else {
+            source = `<span class="badge" style="background:#1e293b;color:#94a3b8;border:1px solid #475569;">🧠 LLM Knowledge</span> `;
+        }
+
+        const formatted = formatAnswer(data.answer || '');
+        let html = `<div class="msg-bubble">${formatted}<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px;align-items:center;">${source}${badges}</div></div>`;
+
+        // Dynamic discovery info
+        if (data.dynamic_api) {
+            const api = data.dynamic_api;
+            let meta = `<div class="meta-title">🔍 Dynamic API Discovery</div>`;
+            meta += `<div class="meta-row"><b>API:</b> ${esc(api.name || '?')}</div>`;
+            meta += `<div class="meta-row"><b>URL:</b> ${esc(api.url || '?')}</div>`;
+            if (api.elapsed_ms) meta += `<div class="meta-row"><b>Discovery:</b> ${api.elapsed_ms.toFixed(0)}ms${api.cached ? ' (cached)' : ''}</div>`;
+            html += `<div class="meta-card sbsa">${meta}</div>`;
+        }
 
         // Tool call metadata
         if (data.tool_used) {
@@ -555,6 +578,27 @@
                 sysMsg('⚠️ Interceptor not running. Start with: python interceptor.py');
             }
         } catch(e) {}
+    }
+
+    function formatAnswer(text) {
+        // Escape HTML first, then apply markdown-like formatting
+        let s = esc(text);
+        // Headers: ## text → bold colored text
+        s = s.replace(/^### (.+)$/gm, '<div style="font-weight:700;color:#60a5fa;margin:8px 0 4px;">$1</div>');
+        s = s.replace(/^## (.+)$/gm, '<div style="font-weight:700;color:#60a5fa;font-size:15px;margin:10px 0 4px;">$1</div>');
+        // Bold: **text**
+        s = s.replace(/\*\*(.+?)\*\*/g, '<b style="color:#f1f5f9">$1</b>');
+        // Inline code: `text`
+        s = s.replace(/`([^`]+)`/g, '<code style="background:#334155;padding:1px 5px;border-radius:3px;font-size:12px;">$1</code>');
+        // Numbered lists: 1. text
+        s = s.replace(/^(\d+)\.\s+(.+)$/gm, '<div style="padding:2px 0 2px 16px;">$1. $2</div>');
+        // Bullet lists: - text
+        s = s.replace(/^[-•]\s+(.+)$/gm, '<div style="padding:2px 0 2px 16px;">• $1</div>');
+        // Links
+        s = s.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" style="color:#60a5fa;text-decoration:underline;">$1</a>');
+        // Newlines to breaks
+        s = s.replace(/\n/g, '<br>');
+        return s;
     }
 
     function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }

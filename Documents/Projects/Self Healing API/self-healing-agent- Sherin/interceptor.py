@@ -14,7 +14,7 @@ Pipeline for every tools/call
                            than being dropped, leaving the healer with nothing to work from.
   3. EXTRA FIELD STRIP   — unknown keys removed AFTER healing.
   4. FORWARD             — repaired request sent to mcp_server.py.
-  5. DRIFT RECOVERY      — V1->V2 field-name drift detected; args re-healed and retried.
+  5. DRIFT RECOVERY      — SBSA latches drift from the server; args re-healed to drift_schema and retried.
   6. RATE-LIMIT (429)    — Retry-After header respected; deterministic sleep + retry.
   7. API TIMEOUT/5xx     — upstream HTTP timeouts AND 5xx errors retried with back-off;
                            LLM decides retry | fallback stub | fail. Per-attempt timing
@@ -129,7 +129,7 @@ class ServerManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TOOL REGISTRY — loaded from api_registry.py
+# TOOL REGISTRY — loaded from api_registry.py  (SBSA: baseline schema + drift shape + aliases)
 # ═══════════════════════════════════════════════════════════════
 
 from api_registry import API_REGISTRY
@@ -144,10 +144,9 @@ for _name, _info in API_REGISTRY.items():
         "category":        _info["domain"],
         "required":        [k for k, v in _v1.items() if v.get("required")],
         "defaults":        {},
-        "v1_fields":       list(_v1.keys()),
-        "v2_fields":       list(_v2.keys()),
-        "v1_schema":       {k: v.get("description", "") for k, v in _v1.items()},
-        "v2_schema":       {k: v.get("description", "") for k, v in _v2.items()},
+        "schema":          {k: v.get("description", "") for k, v in _v1.items()},
+        "drift_schema":    {k: v.get("description", "") for k, v in _v2.items()},
+        "drift_aliases":   {k1: k2 for k1, k2 in zip(_v1.keys(), _v2.keys()) if k1 != k2},
         "expected_result": [],
         "result_ranges":   {},
         "cascade":         _info.get("cascade"),
@@ -157,8 +156,8 @@ for _name, _info in API_REGISTRY.items():
 
 log.info("Interceptor registry: %d tools from api_registry", len(TOOL_REGISTRY))
 
-# Tracks which schema version the server is currently using.
-_server_schema_version: Dict[str, str] = {"version": "v1"}
+# Set True after the server returns error_type=drift; further heals use drift_schema.
+_sbsa_drift_active: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -181,6 +180,36 @@ def _llm(prompt: str, label: str) -> Optional[dict]:
     except Exception as exc:
         log.warning("  LLM[%s] call failed: %s", label, exc)
         return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# STAGE 0 — FUZZY TOOL-NAME MATCHING (tool hallucination recovery)
+# ═══════════════════════════════════════════════════════════════
+
+def fuzzy_match_tool(tool_name: str) -> str:
+    """If tool_name isn't registered, find the closest match via embeddings."""
+    if tool_name in TOOL_REGISTRY:
+        return tool_name
+    known = list(TOOL_REGISTRY.keys())
+    if not known:
+        return tool_name
+    try:
+        from sbsa_engine import _encode_keys
+        query_emb = _encode_keys([tool_name.replace("_", " ")])
+        known_emb = _encode_keys([k.replace("_", " ") for k in known])
+        sims = (query_emb @ known_emb.T)[0]
+        best_idx = int(sims.argmax())
+        best_sim = float(sims[best_idx])
+        if best_sim >= 0.5:
+            log.warning(
+                "  FuzzyTool | '%s' not found → matched '%s' (sim=%.3f)",
+                tool_name, known[best_idx], best_sim,
+            )
+            return known[best_idx]
+        log.warning("  FuzzyTool | '%s' not found, best match '%s' too weak (sim=%.3f)", tool_name, known[best_idx], best_sim)
+    except Exception as e:
+        log.warning("  FuzzyTool | matching failed: %s", e)
+    return tool_name
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -207,7 +236,7 @@ def coerce_types(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# STAGE 2 — SCHEMA HEALING + VALUE NORMALISATION
+# STAGE 2 — SBSA SCHEMA HEALING + VALUE NORMALISATION
 # ═══════════════════════════════════════════════════════════════
 #
 # IMPORTANT: healing runs BEFORE strip_extra_fields.
@@ -219,18 +248,10 @@ def coerce_types(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
 # With healing first, the LLM sees {"location": "London"} and correctly
 # maps it to {"city": "London"}. The strip then passes through cleanly.
 
-def _args_satisfy_schema(tool: str, args: Dict[str, Any], version: str) -> bool:
-    """True if all required field names for the current schema version are present and non-empty."""
-    info = TOOL_REGISTRY.get(tool)
-    if not info or not info["required"]:
-        return True
-    server_fields = info.get(f"{version}_fields") or list(info.get(f"{version}_schema", {}).keys())
-    return bool(server_fields) and all(str(args.get(f, "")).strip() for f in server_fields)
-
-
-class SchemaHealer:
+class SBSA:
     """
-    SBSA-powered deterministic field-name repair.
+    Schema-Based Self-Healing Adapter: maps client args onto the live server field names
+    (baseline schema, or drift_schema after the server signals a rename).
 
     Uses sentence-transformers + Hungarian Algorithm instead of LLM inference.
     Runs in <100ms. No probabilistic guessing.
@@ -241,27 +262,58 @@ class SchemaHealer:
     # Store last alignment report for analytics
     last_report: Optional[Dict[str, Any]] = None
 
+    @staticmethod
+    def target_schema(info: Dict[str, Any]) -> Dict[str, Any]:
+        if _sbsa_drift_active and info.get("drift_schema"):
+            return info["drift_schema"]
+        return info.get("schema") or {}
+
+    @staticmethod
+    def target_field_keys(tool: str) -> list:
+        info = TOOL_REGISTRY.get(tool)
+        if not info:
+            return []
+        return list(SBSA.target_schema(info).keys())
+
+    @staticmethod
+    def args_satisfy(tool: str, args: Dict[str, Any]) -> bool:
+        info = TOOL_REGISTRY.get(tool)
+        if not info or not info["required"]:
+            return True
+        keys = SBSA.target_field_keys(tool)
+        if not keys:
+            return True
+        return all(str(args.get(f, "")).strip() for f in keys)
+
+    @staticmethod
+    def mapped_defaults(info: Dict[str, Any]) -> Dict[str, Any]:
+        base = dict(info.get("defaults") or {})
+        if not _sbsa_drift_active:
+            return base
+        aliases = info.get("drift_aliases") or {}
+        if not aliases:
+            return base
+        return {aliases.get(k, k): v for k, v in base.items()}
+
     @classmethod
-    def heal(cls, tool: str, raw_args: Dict[str, Any], force_version: str = None) -> Dict[str, Any]:
+    def heal(cls, tool: str, raw_args: Dict[str, Any]) -> Dict[str, Any]:
         info = TOOL_REGISTRY.get(tool)
         if info is None:
-            log.warning("  SchemaHealer | unknown tool '%s' — passing through", tool)
+            log.warning("  SBSA | unknown tool '%s' — passing through", tool)
             return raw_args
 
         # Tools with no required args need no healing
         if not info["required"]:
             return {}
 
-        version       = force_version or _server_schema_version["version"]
-        schema        = info.get(f"{version}_schema") or info.get("v1_schema", {})
-        server_fields = info.get(f"{version}_fields") or list(schema.keys())
+        schema        = SBSA.target_schema(info)
+        server_fields = list(schema.keys())
+        using_drift   = bool(_sbsa_drift_active and info.get("drift_schema"))
+        mode          = "drift" if using_drift else "baseline"
 
         # Short-circuit: args already match the current server schema
         if server_fields and all(str(raw_args.get(f, "")).strip() for f in server_fields):
-            log.info(
-                "  SchemaHealer | args already valid for %s — pass-through  %s",
-                version, raw_args
-            )
+            log.info("  SBSA | args already valid (%s) — pass-through  %s", mode, raw_args)
             cls.last_report = None
             return raw_args
 
@@ -270,19 +322,18 @@ class SchemaHealer:
         # ──────────────────────────────────────────────
 
         log.info(
-            "  SchemaHealer | SBSA healing '%s'  schema=%s  raw=%s",
-            tool, version, raw_args,
+            "  SBSA | healing '%s'  mode=%s  raw=%s",
+            tool, mode, raw_args,
         )
 
         # Run deterministic SBSA alignment
         agent_keys = list(raw_args.keys())
 
         # Get descriptions from both schema versions for semantic enrichment
-        # Agent sent v1-style keys, API expects v2-style keys (or vice versa)
-        v1_schema = info.get("v1_schema", {})
-        v2_schema = info.get("v2_schema", {})
+        baseline_schema = info.get("schema", {})
+        drift_schema_desc = info.get("drift_schema", {})
         # Agent descriptions: try the opposite version (agent is likely using the old one)
-        agent_desc = v1_schema if version == "v2" else v2_schema
+        agent_desc = baseline_schema if using_drift else drift_schema_desc
         api_desc = schema  # current version's schema has the descriptions
 
         cls.last_report = sbsa_engine.get_alignment_report(
@@ -297,25 +348,85 @@ class SchemaHealer:
             api_descriptions=api_desc,
         )
 
-        log.info("  SchemaHealer | SBSA healed -> %s  (%.1fms)",
+        log.info("  SBSA | healed -> %s  (%.1fms)",
                  healed, cls.last_report["elapsed_ms"])
         return healed
+
+
+# ═══════════════════════════════════════════════════════════════
+# STAGE 2.5 — DETERMINISTIC VALUE NORMALISATION
+# ═══════════════════════════════════════════════════════════════
+
+_CURRENCY_ALIASES = {
+    "dollar": "USD", "dollars": "USD", "usd": "USD", "us dollar": "USD",
+    "euro": "EUR", "euros": "EUR", "eur": "EUR",
+    "pound": "GBP", "pounds": "GBP", "gbp": "GBP", "sterling": "GBP",
+    "yen": "JPY", "jpy": "JPY", "japanese yen": "JPY",
+    "rupee": "INR", "rupees": "INR", "inr": "INR", "indian rupee": "INR",
+    "yuan": "CNY", "cny": "CNY", "rmb": "CNY", "renminbi": "CNY",
+    "won": "KRW", "krw": "KRW", "franc": "CHF", "chf": "CHF",
+    "real": "BRL", "brl": "BRL", "ruble": "RUB", "rub": "RUB",
+    "bitcoin": "BTC", "btc": "BTC", "ethereum": "ETH", "eth": "ETH",
+}
+
+_TICKER_ALIASES = {
+    "apple": "AAPL", "google": "GOOGL", "alphabet": "GOOGL",
+    "microsoft": "MSFT", "amazon": "AMZN", "tesla": "TSLA",
+    "meta": "META", "facebook": "META", "netflix": "NFLX",
+    "nvidia": "NVDA", "amd": "AMD", "intel": "INTC",
+    "ibm": "IBM", "oracle": "ORCL", "spotify": "SPOT",
+    "uber": "UBER", "airbnb": "ABNB", "disney": "DIS",
+    "coca cola": "KO", "pepsi": "PEP", "nike": "NKE",
+    "walmart": "WMT", "boeing": "BA", "jpmorgan": "JPM",
+}
+
+_COUNTRY_ALIASES = {
+    "usa": "United States", "us": "United States", "america": "United States",
+    "uk": "United Kingdom", "britain": "United Kingdom", "england": "United Kingdom",
+    "uae": "United Arab Emirates", "south korea": "South Korea",
+}
+
+# Fields that should receive currency normalisation
+_CURRENCY_FIELDS = {"base", "target", "currency", "from_currency", "to_currency", "vs_currency"}
+_TICKER_FIELDS = {"symbol", "ticker", "stock"}
+_COUNTRY_FIELDS = {"country", "country_name", "nation"}
+
+
+def normalise_values(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic value cleanup using lookup tables. Zero tokens, <0.1ms."""
+    changed = []
+    out = {}
+    for k, v in args.items():
+        if not isinstance(v, str):
+            out[k] = v
+            continue
+        low = v.strip().lower()
+        if k in _CURRENCY_FIELDS and low in _CURRENCY_ALIASES:
+            out[k] = _CURRENCY_ALIASES[low]
+            changed.append(f"{k}: '{v}' → '{out[k]}'")
+        elif k in _TICKER_FIELDS and low in _TICKER_ALIASES:
+            out[k] = _TICKER_ALIASES[low]
+            changed.append(f"{k}: '{v}' → '{out[k]}'")
+        elif k in _COUNTRY_FIELDS and low in _COUNTRY_ALIASES:
+            out[k] = _COUNTRY_ALIASES[low]
+            changed.append(f"{k}: '{v}' → '{out[k]}'")
+        else:
+            out[k] = v.strip()
+    if changed:
+        log.info("  ValueNorm | %s", ", ".join(changed))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════
 # STAGE 3 — EXTRA FIELD STRIP  (runs AFTER healing)
 # ═══════════════════════════════════════════════════════════════
 
-def strip_extra_fields(tool: str, args: Dict[str, Any], version: str) -> Dict[str, Any]:
-    """
-    Remove keys the server schema does not declare.
-    Must run after SchemaHealer so that misnamed fields are first mapped
-    to their correct names before any unknown keys are dropped.
-    """
+def strip_extra_fields(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove keys not declared on the active SBSA target schema."""
     info = TOOL_REGISTRY.get(tool)
     if info is None:
         return args
-    schema_keys = set(info.get(f"{version}_schema", {}).keys())
+    schema_keys = set(SBSA.target_schema(info).keys())
     if not schema_keys:
         return args
     stripped = {k: v for k, v in args.items() if k in schema_keys}
@@ -323,6 +434,19 @@ def strip_extra_fields(tool: str, args: Dict[str, Any], version: str) -> Dict[st
     if removed:
         log.info("  ExtraFieldStrip | removed unknown keys: %s", removed)
     return stripped
+
+
+def sbsa_apply_drift_aliases(tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Map canonical keys to drift field names for direct server calls (e.g. cascade)."""
+    if not _sbsa_drift_active:
+        return args
+    info = TOOL_REGISTRY.get(tool)
+    if not info:
+        return args
+    aliases = info.get("drift_aliases") or {}
+    if not aliases:
+        return args
+    return {aliases.get(k, k): v for k, v in args.items()}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -585,9 +709,9 @@ def maybe_cascade(
     )
 
     # SBSA HEALING
-    version = _server_schema_version["version"]
-    healed_args = SchemaHealer.heal(next_tool, next_args, force_version=version)
-    healed_args = strip_extra_fields(next_tool, healed_args, version)
+    healed_args = SBSA.heal(next_tool, next_args)
+    healed_args = strip_extra_fields(next_tool, healed_args)
+    healed_args = sbsa_apply_drift_aliases(next_tool, healed_args)
 
     if healed_args != next_args:
         log.info("DEBUG Cascade HEALED | %s -> %s", next_args, healed_args)
@@ -698,6 +822,48 @@ def reassess_result(tool: str, arguments: Dict[str, Any], result: Any) -> Any:
 
 
 # ═══════════════════════════════════════════════════════════════
+# STAGE 12 — RESULT INTEGRITY CHECK (gaslighting detection)
+# ═══════════════════════════════════════════════════════════════
+
+def check_result_integrity(tool_data: dict, llm_summary: str) -> Optional[str]:
+    """
+    Compare key numeric/factual values in tool output against the LLM summary.
+    If the LLM's summary contradicts the tool's actual data, flag it.
+    Returns a warning string, or None if integrity holds.
+
+    This catches "gaslighting" — where the LLM ignores tool output and
+    substitutes values from its training data.
+    """
+    if not isinstance(tool_data, dict) or not llm_summary:
+        return None
+
+    mismatches = []
+    for key, val in tool_data.items():
+        if key.startswith("_"):
+            continue
+        # Check numeric values
+        try:
+            num = float(val)
+            # Look for this number (or close to it) in the summary
+            import re
+            # Extract all numbers from summary
+            summary_nums = [float(x) for x in re.findall(r'[\d,]+\.?\d*', llm_summary.replace(",", ""))]
+            if summary_nums and abs(num) > 1:
+                # Check if any summary number is within 10% of the tool value
+                close = any(abs(s - num) / max(abs(num), 1) < 0.1 for s in summary_nums)
+                if not close and abs(num) > 10:
+                    mismatches.append(f"{key}={val} not reflected in summary")
+        except (ValueError, TypeError):
+            continue
+
+    if mismatches:
+        warning = "Integrity check: " + "; ".join(mismatches[:3])
+        log.warning("  IntegrityCheck | ⚠ %s", warning)
+        return warning
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
 # PER-CLIENT PROXY SESSION
 # ═══════════════════════════════════════════════════════════════
 
@@ -757,9 +923,10 @@ class ProxySession:
 
             # Intercept set_drift to reset our schema version tracker
             if method == "set_drift":
+                global _sbsa_drift_active
+                _sbsa_drift_active = False
                 drift_active = req.get("params", {}).get("active", False)
-                _server_schema_version["version"] = "v1"
-                log.info("DRIFT TOGGLED → %s  (interceptor schema reset to v1)",
+                log.info("DRIFT TOGGLED → %s  (interceptor SBSA reset to baseline)",
                          "ON 🔴" if drift_active else "OFF 🟢")
 
             log.info("pass-through  method=%s  id=%s", method, req.get("id"))
@@ -780,29 +947,39 @@ class ProxySession:
             })
 
     def _tool_call_pipeline(self, req: dict):
+        global _sbsa_drift_active
         params    = req.get("params", {})
         tool_name = params.get("name", "")
         raw_args  = params.get("arguments", {})
-        version   = _server_schema_version["version"]
+        drift_tag = "drift" if _sbsa_drift_active else "baseline"
 
         pipeline_start = time.monotonic()
         log.info("=" * 60)
-        log.info("PIPELINE START  tool=%-22s  schema=%s", tool_name, version)
+        log.info("PIPELINE START  tool=%-22s  SBSA=%s", tool_name, drift_tag)
         log.info("  raw_args = %s", raw_args)
+
+        # Stage 0: Fuzzy tool-name matching (tool hallucination recovery)
+        resolved_name = fuzzy_match_tool(tool_name)
+        if resolved_name != tool_name:
+            tool_name = resolved_name
+            params["name"] = tool_name
 
         # Stage 1: Type coercion
         args = coerce_types(tool_name, raw_args)
 
-        # Stage 2: Schema healing + value normalisation (BEFORE strip)
-        if _args_satisfy_schema(tool_name, args, version):
+        # Stage 2: SBSA schema healing + value normalisation (BEFORE strip)
+        if SBSA.args_satisfy(tool_name, args):
             healed = args
-            SchemaHealer.last_report = None
-            log.info("  SchemaHealer | args already valid — pass-through  %s", healed)
+            SBSA.last_report = None
+            log.info("  SBSA | args already valid — pass-through  %s", healed)
         else:
-            healed = SchemaHealer.heal(tool_name, args)
+            healed = SBSA.heal(tool_name, args)
+
+        # Stage 2.5: Deterministic value normalisation
+        healed = normalise_values(tool_name, healed)
 
         # Stage 3: Strip extra/unknown fields (AFTER healing)
-        healed = strip_extra_fields(tool_name, healed, version)
+        healed = strip_extra_fields(tool_name, healed)
 
         req["params"]["arguments"] = healed
         log.info("  healed = %s", healed)
@@ -818,21 +995,22 @@ class ProxySession:
             "success" if "result" in resp else _classify_error(resp),
         )
 
-        # Stage 5: Drift recovery
+        # Stage 5: Drift recovery (latch drift_schema, re-heal, retry)
         if resp.get("error", {}).get("error_type") == "drift":
-            old_v = _server_schema_version["version"]
-            _server_schema_version["version"] = "v2"
-            log.warning("  DRIFT DETECTED — schema %s -> v2; re-healing ...", old_v)
-            healed_v2 = SchemaHealer.heal(tool_name, raw_args, force_version="v2")
-            healed_v2 = strip_extra_fields(tool_name, healed_v2, "v2")
-            req["params"]["arguments"] = healed_v2
-            log.info("  re-healed (v2) = %s", healed_v2)
-            resp = self._forward_with_retry(req, tool_name, healed_v2)
+            _sbsa_drift_active = True
+            log.warning("  SBSA | DRIFT DETECTED — latching drift_schema; re-healing ...")
+            args_retry   = coerce_types(tool_name, raw_args)
+            healed_drift = SBSA.heal(tool_name, args_retry)
+            healed_drift = strip_extra_fields(tool_name, healed_drift)
+            req["params"]["arguments"] = healed_drift
+            log.info("  re-healed (drift) = %s", healed_drift)
+            resp = self._forward_with_retry(req, tool_name, healed_drift)
 
             if "result" in resp:
+                healed = healed_drift
                 sc = resp["result"].get("structuredContent", {})
                 if isinstance(sc, dict):
-                    sc["_drift_healed"] = f"Schema drift auto-corrected: {raw_args} -> {healed_v2}"
+                    sc["_sbsa_drift_note"] = f"Schema drift auto-corrected: {raw_args} -> {healed_drift}"
                 resp["result"]["structuredContent"] = sc
 
         # Stages 8-11: Post-processing
@@ -856,10 +1034,10 @@ class ProxySession:
             model=LLM_MODEL,
             outcome=outcome,
             total_elapsed_s=time.monotonic() - pipeline_start,
-            sbsa_report=SchemaHealer.last_report,
+            sbsa_report=SBSA.last_report,
         )
-        if SchemaHealer.last_report:
-            rpt = SchemaHealer.last_report
+        if SBSA.last_report:
+            rpt = SBSA.last_report
             info = TOOL_REGISTRY.get(tool_name, {})
             analytics_logger.record_healing_event(
                 tool=tool_name,
@@ -873,7 +1051,7 @@ class ProxySession:
                 sbsa_elapsed_ms=rpt.get("elapsed_ms", 0),
                 healed_successfully=outcome == "success",
                 threshold=rpt.get("threshold", 0.4),
-                schema_version=version,
+                schema_version=drift_tag,
             )
 
         log.info(

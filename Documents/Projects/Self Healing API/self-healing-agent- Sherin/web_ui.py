@@ -22,6 +22,7 @@ from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 
 import adapters
+import dynamic_discovery
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -242,6 +243,79 @@ def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False,
         log.info("LLM decision: %s", decision)
 
         if "final" in decision:
+            # Check if this question likely needs live/real-time data
+            # If not, the LLM's direct answer is probably fine
+            _LIVE_DATA_KEYWORDS = [
+                "current", "right now", "today", "latest", "live", "real-time",
+                "price of", "weather", "trending", "status", "track",
+                "random", "generate", "show me", "give me a",
+            ]
+            # Topics where no free/no-auth API exists — skip discovery
+            _SKIP_DISCOVERY = [
+                "email", "sms", "send", "login", "password", "auth",
+            ]
+            needs_api = any(kw in question.lower() for kw in _LIVE_DATA_KEYWORDS)
+            skip = any(kw in question.lower() for kw in _SKIP_DISCOVERY)
+            needs_api = any(kw in question.lower() for kw in _LIVE_DATA_KEYWORDS)
+
+            if needs_api and not skip:
+                step("discovery", "No registered tool matched — discovering API...")
+                log.info("No tool match, trying dynamic discovery for: %s", question[:80])
+                discovery = dynamic_discovery.discover_and_call(question)
+                if discovery and "error" not in discovery.get("result", {}):
+                    api = discovery["api_info"]
+                    tool_name = discovery["tool_name"]
+                    result["tool_used"] = tool_name
+                    raw_args = api.get("extract_from_question", {})
+                    result["raw_args"] = raw_args
+                    result["dynamic_api"] = {
+                        "name": api.get("api_name"),
+                        "url": api.get("base_url"),
+                        "cached": discovery.get("cached", False),
+                        "elapsed_ms": discovery.get("elapsed_ms"),
+                        "schema_source": dynamic_discovery._dynamic_tools.get(tool_name, {}).get("schema_source", "unknown"),
+                    }
+
+                    # Route through interceptor for full SBSA pipeline if available
+                    tool_data = None
+                    if use_interceptor:
+                        try:
+                            step("tool_call", f"Calling {tool_name} via SBSA pipeline...")
+                            resp = transport.send({
+                                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+                                "params": {"name": tool_name, "arguments": raw_args},
+                            })
+                            if "result" in resp:
+                                tool_data = resp["result"].get("structuredContent", resp["result"])
+                                result["healing_steps"].append("🛡️ Routed through SBSA pipeline")
+                        except Exception as e:
+                            log.warning("Interceptor routing failed for %s: %s, using direct result", tool_name, e)
+
+                    # Fallback to direct discovery result
+                    if tool_data is None:
+                        tool_data = discovery["result"]
+
+                    step("summarize", "LLM generating answer from discovered API...")
+                    clean_data = tool_data if isinstance(tool_data, dict) else tool_data
+                    result["raw_tool_data"] = clean_data
+                    summary_prompt = f"""Question: {question}
+
+API result from {api.get('api_name', 'discovered API')}:
+{json.dumps(clean_data, indent=2)}
+
+Answer naturally using the data. Be concise but complete."""
+                    result["answer"] = adapter.summarize(summary_prompt, {})
+                    result["healing_steps"].append(f"🔍 Dynamic discovery: {api.get('api_name')} ({api.get('base_url')})")
+
+                    # Result integrity check
+                    from interceptor import check_result_integrity
+                    if isinstance(clean_data, dict) and isinstance(result["answer"], str):
+                        integrity_warning = check_result_integrity(clean_data, result["answer"])
+                        if integrity_warning:
+                            result["warnings"].append(integrity_warning)
+                    return result
+
+            # LLM's own knowledge is sufficient, or discovery failed
             result["answer"] = decision["final"]
             return result
 
@@ -270,7 +344,7 @@ def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False,
             # Distinguish LLM-missing-args from SBSA failure
             if etype == "schema" and "Missing required field" in msg:
                 info = TOOL_REGISTRY.get(tool_name, {})
-                required = list(info.get("v1_schema", {}).keys())
+                required = list(info.get("schema", {}).keys())
                 sent = list(raw_args.keys())
                 missing = [f for f in required if f not in raw_args]
                 result["error"] = {"type": "llm_incomplete", "code": error.get("code"),
@@ -294,8 +368,9 @@ def ask_agent(question: str, use_interceptor: bool, drift_enabled: bool = False,
         if isinstance(tool_data, dict):
             if "_interceptor_warning" in tool_data:
                 result["warnings"].append(tool_data["_interceptor_warning"])
-            if "_drift_healed" in tool_data:
-                result["healing_steps"].append(f"🔧 {tool_data['_drift_healed']}")
+            drift_note = tool_data.get("_sbsa_drift_note") or tool_data.get("_drift_healed")
+            if drift_note:
+                result["healing_steps"].append(f"🔧 {drift_note}")
 
             cascade_keys = [k for k in tool_data if k.startswith("_cascade_")]
             if cascade_keys:
@@ -345,6 +420,15 @@ Answer naturally using all available information, including any cascaded results
 Include key facts. Be concise but complete."""
         
         result["answer"] = adapter.summarize(summary_prompt, {})  # Use prompt directly
+
+        # Stage 12: Result integrity check (gaslighting detection)
+        from interceptor import check_result_integrity
+        if isinstance(clean_data, dict) and isinstance(result["answer"], str):
+            integrity_warning = check_result_integrity(clean_data, result["answer"])
+            if integrity_warning:
+                result["warnings"].append(integrity_warning)
+                result["healing_steps"].append(f"⚠️ {integrity_warning}")
+
         return result
 
     except Exception as e:

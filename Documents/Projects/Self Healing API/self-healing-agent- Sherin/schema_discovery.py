@@ -50,7 +50,11 @@ _load_cache()
 # METHOD 1: OpenAPI / Swagger auto-discovery
 # ═══════════════════════════════════════════════════════════════
 
-OPENAPI_PATHS = ["/openapi.json", "/swagger.json", "/api-docs", "/.well-known/openapi.yaml"]
+OPENAPI_PATHS = [
+    "/openapi.json", "/swagger.json", "/api-docs", "/.well-known/openapi.yaml",
+    "/docs", "/api/docs", "/v1/openapi.json", "/v2/openapi.json", "/v3/openapi.json",
+    "/api/openapi.json", "/api/swagger.json", "/schema", "/api/schema",
+]
 
 def try_openapi(base_url: str) -> Optional[List[dict]]:
     """Try to fetch OpenAPI spec from standard paths."""
