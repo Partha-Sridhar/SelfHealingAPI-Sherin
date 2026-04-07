@@ -329,88 +329,107 @@ Answer naturally using the data. Be concise but complete."""
         result["tool_used"] = tool_name
         result["raw_args"] = raw_args
 
-        # Step 2: Send tool call through MCP (interceptor or direct)
-        step("tool_call", f"Calling {tool_name}({json.dumps(raw_args)[:60]})")
-        resp = transport.send({
-            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
-            "params": {"name": tool_name, "arguments": raw_args},
-        })
+        # ═══════════════════════════════════════════════════════════
+        # MULTI-STEP TOOL EXECUTION LOOP
+        # LLM keeps calling tools until it has enough info to answer
+        # ═══════════════════════════════════════════════════════════
+        MAX_TOOL_STEPS = 8
+        all_tool_results = {}
+        tools_called = []
+        current_tool = tool_name
+        current_args = raw_args
 
-        if "error" in resp:
-            error = resp["error"]
-            etype = error.get("error_type", "unknown")
-            msg = error.get("message", "Unknown error")
+        for step_num in range(1, MAX_TOOL_STEPS + 1):
+            step("tool_call", f"Step {step_num}: {current_tool}({json.dumps(current_args)[:50]})")
+            tools_called.append(current_tool)
 
-            # Distinguish LLM-missing-args from SBSA failure
-            if etype == "schema" and "Missing required field" in msg:
-                info = TOOL_REGISTRY.get(tool_name, {})
-                required = list(info.get("schema", {}).keys())
-                sent = list(raw_args.keys())
-                missing = [f for f in required if f not in raw_args]
-                result["error"] = {"type": "llm_incomplete", "code": error.get("code"),
-                    "message": f"LLM forgot to include required parameter(s): {missing}. "
-                               f"LLM sent: {sent}. Tool requires: {required}. "
-                               f"Note: SBSA can heal wrong field names but cannot invent missing values."}
-                result["answer"] = (
-                    f"⚠️ LLM Incomplete Call: The LLM forgot to send parameter(s) {missing}. "
-                    f"It only sent {sent}. SBSA heals wrong names, not missing arguments — "
-                    f"this is an LLM limitation, not a middleware failure.")
+            resp = transport.send({
+                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+                "params": {"name": current_tool, "arguments": current_args},
+            })
+
+            if "error" in resp:
+                error = resp["error"]
+                etype = error.get("error_type", "unknown")
+                msg = error.get("message", "Unknown error")
+                if etype == "schema" and "Missing required field" in msg:
+                    info = TOOL_REGISTRY.get(current_tool, {})
+                    required = list(info.get("schema", {}).keys())
+                    sent = list(current_args.keys())
+                    missing = [f for f in required if f not in current_args]
+                    result["error"] = {"type": "llm_incomplete", "code": error.get("code"),
+                        "message": f"LLM forgot parameter(s): {missing}. Sent: {sent}. Requires: {required}."}
+                else:
+                    result["error"] = {"type": etype, "code": error.get("code"), "message": msg}
+                # Don't break — feed error to LLM, let it try something else
+                step("tool_call", f"Step {step_num} failed: {msg[:60]}")
+                break
+
+            tool_data = resp["result"].get("structuredContent", resp["result"])
+
+            # Collect metadata
+            if isinstance(tool_data, dict):
+                if "_interceptor_warning" in tool_data:
+                    result["warnings"].append(tool_data["_interceptor_warning"])
+                drift_note = tool_data.get("_sbsa_drift_note") or tool_data.get("_drift_healed")
+                if drift_note:
+                    result["healing_steps"].append(f"🔧 Step {step_num}: {drift_note}")
+
+                clean = {k: v for k, v in tool_data.items() if not k.startswith("_")}
+                all_tool_results[current_tool] = clean
             else:
-                result["error"] = {"type": etype, "code": error.get("code"), "message": msg}
-                prefix = {"schema": "❌ Schema Error", "timeout": "⏱️ Timeout",
-                           "network": "🌐 Network Error", "api": "⚠️ API Error",
-                           "drift": "🔀 Schema Drift"}.get(etype, "❌ Error")
-                result["answer"] = f"{prefix}: {msg}"
-            return result
-
-        tool_data = resp["result"].get("structuredContent", resp["result"])
-
-        if isinstance(tool_data, dict):
-            if "_interceptor_warning" in tool_data:
-                result["warnings"].append(tool_data["_interceptor_warning"])
-            drift_note = tool_data.get("_sbsa_drift_note") or tool_data.get("_drift_healed")
-            if drift_note:
-                result["healing_steps"].append(f"🔧 {drift_note}")
-
-            cascade_keys = [k for k in tool_data if k.startswith("_cascade_")]
-            if cascade_keys:
-                result["cascade_data"] = {k: tool_data[k] for k in cascade_keys}
-                # Build cascade summary for UI
-                cascaded_tools = []
-                for key in cascade_keys:
-                    tool_name = key.replace("_cascade_", "").replace("_", " ")
-                    tool_data_short = str(tool_data[key])[:100]
-                    cascaded_tools.append(f"{tool_name}: {tool_data_short}...")
-                result["cascaded_tools"] = cascaded_tools
-                result["cascade_summary"] = f"🔄 Cascade executed ({len(cascade_keys)} tools): " + "; ".join(cascaded_tools)
+                all_tool_results[current_tool] = tool_data
 
             if use_interceptor:
-                result["healed_args"] = raw_args
-                result["healing_steps"].insert(0, "✓ SBSA alignment — deterministic key mapping")
-                try:
-                    log_dir = os.path.join(os.path.dirname(__file__), "benchmark_logs")
-                    if os.path.isdir(log_dir):
-                        logs = sorted(f for f in os.listdir(log_dir) if f.endswith(".jsonl"))
-                        if logs:
-                            with open(os.path.join(log_dir, logs[-1])) as f:
-                                lines = f.readlines()
-                            if lines:
-                                last = json.loads(lines[-1])
-                                if last.get("tool") == tool_name:
-                                    result["sbsa_report"] = {
-                                        "similarity_scores": last.get("similarity_scores") or last.get("sbsa_similarities", {}),
-                                        "elapsed_ms": last.get("sbsa_elapsed_ms", 0),
-                                        "mapping": last.get("mapping") or last.get("sbsa_mapping", {}),
-                                    }
-                except Exception:
-                    pass
+                result["healing_steps"].insert(0, f"✓ Step {step_num}: SBSA healed {current_tool}")
 
-        # Step 3: LLM summarizes the result - preserve full cascade data
-        step("summarize", "LLM generating answer...")
-        clean_data = tool_data if isinstance(tool_data, dict) else tool_data
-        result["raw_tool_data"] = clean_data  # Preserve full data for UI
-        
-        # Better summarize prompt for cascades
+            # Ask LLM: do you need another tool call?
+            collected_summary = json.dumps(all_tool_results, indent=1)[:800]
+            next_decision = adapter.route(
+                f"Original question: {question}\n\n"
+                f"Data collected so far:\n{collected_summary}\n\n"
+                f"Do you need to call another tool to fully answer the question? "
+                f"If yes, call the next tool. If you have enough data, give a final text answer.",
+                tools,
+            )
+
+            if "final" in next_decision:
+                # LLM has enough data — break and summarize
+                break
+            elif "tool" in next_decision:
+                current_tool = next_decision["tool"]
+                current_args = next_decision.get("arguments", {})
+                result["tool_used"] = ", ".join(tools_called + [current_tool])
+            else:
+                break
+
+        # Collect SBSA report from last log entry
+        if use_interceptor:
+            try:
+                log_dir = os.path.join(os.path.dirname(__file__), "benchmark_logs")
+                if os.path.isdir(log_dir):
+                    logs = sorted(f for f in os.listdir(log_dir) if f.endswith(".jsonl"))
+                    if logs:
+                        with open(os.path.join(log_dir, logs[-1])) as f:
+                            lines = f.readlines()
+                        if lines:
+                            last = json.loads(lines[-1])
+                            result["sbsa_report"] = {
+                                "similarity_scores": last.get("similarity_scores") or last.get("sbsa_similarities", {}),
+                                "elapsed_ms": last.get("sbsa_elapsed_ms", 0),
+                                "mapping": last.get("mapping") or last.get("sbsa_mapping", {}),
+                            }
+            except Exception:
+                pass
+
+        result["tool_used"] = ", ".join(tools_called)
+        result["raw_args"] = raw_args
+        result["raw_tool_data"] = all_tool_results
+
+        # Step 3: LLM summarizes ALL collected results
+        step("summarize", f"LLM summarizing {len(all_tool_results)} tool results...")
+        clean_data = all_tool_results
+
         summary_prompt = f"""Question: {question}
 
 Tool result (includes cascade chain if executed):

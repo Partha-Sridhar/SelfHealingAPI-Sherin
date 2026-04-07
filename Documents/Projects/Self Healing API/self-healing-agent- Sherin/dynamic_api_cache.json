@@ -1,0 +1,84 @@
+{
+  "latest news in india": {
+    "tool_name": "dynamic_india_news",
+    "api_info": {
+      "api_name": "india_news",
+      "description": "Get the latest news in India",
+      "base_url": "https://api.rss2json.com/v1/api.json",
+      "method": "GET",
+      "params": {
+        "rss_url": {
+          "description": "RSS feed URL",
+          "required": true,
+          "example": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+        }
+      },
+      "extract_from_question": {
+        "rss_url": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+      }
+    },
+    "args": {
+      "rss_url": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+    },
+    "discovered_at": "2026-04-05T23:22:59"
+  },
+  "what is the latest news on the us iran war?": {
+    "tool_name": "dynamic_rss2json",
+    "api_info": {
+      "api_name": "rss2json",
+      "description": "converts any RSS feed to JSON",
+      "base_url": "https://api.rss2json.com/v1/api.json",
+      "method": "GET",
+      "params": {
+        "rss_url": {
+          "description": "the RSS feed URL to convert",
+          "required": true,
+          "example": "https://feeds.bbci.co.uk/news/world/rss.xml"
+        }
+      },
+      "extract_from_question": {
+        "rss_url": "https://feeds.bbci.co.uk/news/world/rss.xml"
+      }
+    },
+    "args": {
+      "rss_url": "https://feeds.bbci.co.uk/news/world/rss.xml"
+    },
+    "discovered_at": "2026-04-05T23:23:58"
+  },
+  "what is the current news on kerala elections": {
+    "tool_name": "dynamic_kerala_elections_news",
+    "api_info": {
+      "api_name": "kerala_elections_news",
+      "description": "Get the current news on Kerala Elections",
+      "base_url": "https://api.rss2json.com/v1/api.json",
+      "method": "GET",
+      "params": {
+        "rss_url": {
+          "description": "The RSS feed URL to convert to JSON",
+          "required": true,
+          "example": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+        }
+      },
+      "extract_from_question": {
+        "rss_url": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+      }
+    },
+    "args": {
+      "rss_url": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+    },
+    "discovered_at": "2026-04-05T23:24:33"
+  },
+  "give me a random cat fact": {
+    "tool_name": "dynamic_cat_fact",
+    "api_info": {
+      "api_name": "cat_fact",
+      "description": "Returns a random cat fact",
+      "base_url": "https://catfact.ninja/fact",
+      "method": "GET",
+      "params": {},
+      "extract_from_question": {}
+    },
+    "args": {},
+    "discovered_at": "2026-04-05T23:47:41"
+  }
+}

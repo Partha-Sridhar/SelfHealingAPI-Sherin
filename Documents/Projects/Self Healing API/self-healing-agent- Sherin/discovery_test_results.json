@@ -1,0 +1,302 @@
+[
+  {
+    "q": "Where is the ISS right now?",
+    "status": "api_error",
+    "tool": "dynamic_iss_now",
+    "time_s": 8.6
+  },
+  {
+    "q": "Give me a random inspirational quote",
+    "status": "ok",
+    "tool": "dynamic_zenquotes",
+    "time_s": 1.0
+  },
+  {
+    "q": "How many people are in space right now?",
+    "status": "ok",
+    "tool": "dynamic_open_notify",
+    "time_s": 6.8
+  },
+  {
+    "q": "Tell me a random cat fact",
+    "status": "ok",
+    "tool": "dynamic_cat_fact",
+    "time_s": 1.6
+  },
+  {
+    "q": "What is the current price of gold?",
+    "status": "ok",
+    "tool": "dynamic_alpha_vantage",
+    "time_s": 2.1
+  },
+  {
+    "q": "What is my public IP address?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 2.4
+  },
+  {
+    "q": "Generate a random color hex code",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 1.6
+  },
+  {
+    "q": "What are the top headlines today?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.0
+  },
+  {
+    "q": "Tell me a random dog fact",
+    "status": "ok",
+    "tool": "dynamic_catfact_ninja",
+    "time_s": 7.8
+  },
+  {
+    "q": "What is the population of the world?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.1
+  },
+  {
+    "q": "Give me a random trivia question",
+    "status": "api_error",
+    "tool": "dynamic_opentdb",
+    "time_s": 2.4
+  },
+  {
+    "q": "What is the current Bitcoin block height?",
+    "status": "ok",
+    "tool": "dynamic_blockcypher",
+    "time_s": 5.8
+  },
+  {
+    "q": "Show me a random fox image",
+    "status": "ok",
+    "tool": "dynamic_random_fox",
+    "time_s": 2.4
+  },
+  {
+    "q": "What is the exchange rate of EUR to INR?",
+    "status": "api_error",
+    "tool": "dynamic_exchange_rate",
+    "time_s": 4.3
+  },
+  {
+    "q": "Tell me about the planet Mars",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.8
+  },
+  {
+    "q": "What is the latest xkcd comic?",
+    "status": "ok",
+    "tool": "dynamic_xkcd",
+    "time_s": 1.6
+  },
+  {
+    "q": "Generate a random UUID",
+    "status": "ok",
+    "tool": "dynamic_uuid_api",
+    "time_s": 1.5
+  },
+  {
+    "q": "What is the speed of light?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 0.4
+  },
+  {
+    "q": "Show me a random meme",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.2
+  },
+  {
+    "q": "What are the holidays in India this year?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 4.0
+  },
+  {
+    "q": "Tell me a random Chuck Norris joke",
+    "status": "ok",
+    "tool": "dynamic_chuck_norris_joke",
+    "time_s": 2.4
+  },
+  {
+    "q": "What is the current time in UTC?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 1.8
+  },
+  {
+    "q": "Give me a random word",
+    "status": "ok",
+    "tool": "dynamic_random_word_api",
+    "time_s": 2.1
+  },
+  {
+    "q": "What is the boiling point of water?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.0
+  },
+  {
+    "q": "Show me the GitHub profile of torvalds",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 2.1
+  },
+  {
+    "q": "What is the current phase of the moon?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 2.4
+  },
+  {
+    "q": "Tell me a random number fact",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 4.1
+  },
+  {
+    "q": "What is the capital of Mongolia?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 2.2
+  },
+  {
+    "q": "Give me a random advice",
+    "status": "ok",
+    "tool": "dynamic_zenquotes",
+    "time_s": 2.3
+  },
+  {
+    "q": "What is the current earthquake activity?",
+    "status": "ok",
+    "tool": "dynamic_earthquake_api",
+    "time_s": 5.8
+  },
+  {
+    "q": "Show me a random avatar image",
+    "status": "ok",
+    "tool": "dynamic_dog_ceo",
+    "time_s": 8.7
+  },
+  {
+    "q": "What is the meaning of the word serendipity?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.1
+  },
+  {
+    "q": "Tell me about the Eiffel Tower",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 5.0
+  },
+  {
+    "q": "What is the current UV index in London?",
+    "status": "ok",
+    "tool": "dynamic_open_meteo",
+    "time_s": 1.9
+  },
+  {
+    "q": "Give me a random programming joke",
+    "status": "api_error",
+    "tool": "dynamic_joke_api",
+    "time_s": 4.1
+  },
+  {
+    "q": "What is the distance from Earth to the Moon?",
+    "status": "ok",
+    "tool": "dynamic_open_notify",
+    "time_s": 6.3
+  },
+  {
+    "q": "Show me trending repositories on GitHub",
+    "status": "ok",
+    "tool": "dynamic_github_trending",
+    "time_s": 2.9
+  },
+  {
+    "q": "What is the current air quality in Delhi?",
+    "status": "ok",
+    "tool": "dynamic_waqi",
+    "time_s": 3.4
+  },
+  {
+    "q": "Tell me a random history fact",
+    "status": "ok",
+    "tool": "dynamic_uselessfacts",
+    "time_s": 2.5
+  },
+  {
+    "q": "What is the ISBN of Harry Potter?",
+    "status": "ok",
+    "tool": "dynamic_open_library",
+    "time_s": 2.0
+  },
+  {
+    "q": "Give me a random cocktail recipe",
+    "status": "ok",
+    "tool": "dynamic_the_cocktail_db",
+    "time_s": 1.8
+  },
+  {
+    "q": "What is the elevation of Mount Everest?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.8
+  },
+  {
+    "q": "Show me a random user profile",
+    "status": "ok",
+    "tool": "dynamic_random_user",
+    "time_s": 1.9
+  },
+  {
+    "q": "What is the current Ethereum gas price?",
+    "status": "ok",
+    "tool": "dynamic_eth_gas_price",
+    "time_s": 5.4
+  },
+  {
+    "q": "Tell me about the Titanic",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 4.7
+  },
+  {
+    "q": "What is the sunrise time in Tokyo?",
+    "status": "ok",
+    "tool": "dynamic_ip_geolocation",
+    "time_s": 6.9
+  },
+  {
+    "q": "Give me a random Bible verse",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 6.3
+  },
+  {
+    "q": "What is the atomic number of gold?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 7.6
+  },
+  {
+    "q": "Show me a random kanye west quote",
+    "status": "ok",
+    "tool": "dynamic_zenquotes",
+    "time_s": 4.2
+  },
+  {
+    "q": "What is the current world population clock?",
+    "status": "no_api",
+    "tool": null,
+    "time_s": 3.4
+  }
+]
