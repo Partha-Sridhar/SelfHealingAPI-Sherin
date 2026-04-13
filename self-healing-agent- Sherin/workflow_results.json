@@ -1,0 +1,172 @@
+{
+  "controlled": {
+    "sbsa_on": {
+      "3_step_person_origin": {
+        "num_steps": 3,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.3333,
+        "lusser_prediction": 0.037,
+        "lusser_delta": -0.037,
+        "avg_elapsed_s": 6.59
+      },
+      "3_step_book_author": {
+        "num_steps": 3,
+        "runs": 1,
+        "task_success_rate": 1.0,
+        "per_step_accuracy": 1.0,
+        "lusser_prediction": 1.0,
+        "lusser_delta": 0.0,
+        "avg_elapsed_s": 9.91
+      },
+      "5_step_trip_planner": {
+        "num_steps": 5,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.2,
+        "lusser_prediction": 0.0003,
+        "lusser_delta": -0.0003,
+        "avg_elapsed_s": 6.18
+      },
+      "5_step_crypto_investor": {
+        "num_steps": 5,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.6,
+        "lusser_prediction": 0.0778,
+        "lusser_delta": -0.0778,
+        "avg_elapsed_s": 38.36
+      },
+      "7_step_person_dossier": {
+        "num_steps": 7,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.4286,
+        "lusser_prediction": 0.0027,
+        "lusser_delta": -0.0027,
+        "avg_elapsed_s": 9.06
+      },
+      "10_step_world_explorer": {
+        "num_steps": 10,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.3,
+        "lusser_prediction": 0.0,
+        "lusser_delta": -0.0,
+        "avg_elapsed_s": 8.6
+      }
+    },
+    "sbsa_off": {
+      "3_step_person_origin": {
+        "num_steps": 3,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.3333,
+        "lusser_prediction": 0.037,
+        "lusser_delta": -0.037,
+        "avg_elapsed_s": 1.93
+      },
+      "3_step_book_author": {
+        "num_steps": 3,
+        "runs": 1,
+        "task_success_rate": 1.0,
+        "per_step_accuracy": 1.0,
+        "lusser_prediction": 1.0,
+        "lusser_delta": 0.0,
+        "avg_elapsed_s": 3.62
+      },
+      "5_step_trip_planner": {
+        "num_steps": 5,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.2,
+        "lusser_prediction": 0.0003,
+        "lusser_delta": -0.0003,
+        "avg_elapsed_s": 1.9
+      },
+      "5_step_crypto_investor": {
+        "num_steps": 5,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.6,
+        "lusser_prediction": 0.0778,
+        "lusser_delta": -0.0778,
+        "avg_elapsed_s": 1.68
+      },
+      "7_step_person_dossier": {
+        "num_steps": 7,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.4286,
+        "lusser_prediction": 0.0027,
+        "lusser_delta": -0.0027,
+        "avg_elapsed_s": 3.64
+      },
+      "10_step_world_explorer": {
+        "num_steps": 10,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.3,
+        "lusser_prediction": 0.0,
+        "lusser_delta": -0.0,
+        "avg_elapsed_s": 3.64
+      }
+    },
+    "sbsa_drift": {
+      "3_step_person_origin": {
+        "num_steps": 3,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.3333,
+        "lusser_prediction": 0.037,
+        "lusser_delta": -0.037,
+        "avg_elapsed_s": 6.54
+      },
+      "3_step_book_author": {
+        "num_steps": 3,
+        "runs": 1,
+        "task_success_rate": 1.0,
+        "per_step_accuracy": 1.0,
+        "lusser_prediction": 1.0,
+        "lusser_delta": 0.0,
+        "avg_elapsed_s": 2.43
+      },
+      "5_step_trip_planner": {
+        "num_steps": 5,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.2,
+        "lusser_prediction": 0.0003,
+        "lusser_delta": -0.0003,
+        "avg_elapsed_s": 6.24
+      },
+      "5_step_crypto_investor": {
+        "num_steps": 5,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.6,
+        "lusser_prediction": 0.0778,
+        "lusser_delta": -0.0778,
+        "avg_elapsed_s": 22.15
+      },
+      "7_step_person_dossier": {
+        "num_steps": 7,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.4286,
+        "lusser_prediction": 0.0027,
+        "lusser_delta": -0.0027,
+        "avg_elapsed_s": 8.41
+      },
+      "10_step_world_explorer": {
+        "num_steps": 10,
+        "runs": 1,
+        "task_success_rate": 0.0,
+        "per_step_accuracy": 0.3,
+        "lusser_prediction": 0.0,
+        "lusser_delta": -0.0,
+        "avg_elapsed_s": 8.27
+      }
+    }
+  }
+}
